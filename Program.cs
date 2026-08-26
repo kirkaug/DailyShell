@@ -3393,10 +3393,12 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
 // Shows content in a full-screen pager starting at the top. Up/Down scroll one line,
 // PgUp/PgDn/Space scroll a screen, Home/End jump, Enter/Esc/Q return.
 // Returns the action key that was pressed (e.g. R to reply, A to archive), or
-// null on a normal exit.
+// null on a normal exit. With autoRefresh set, returns ConsoleKey.F5 after that
+// much idle time — but only while the view sits at the end (a reader scrolled up
+// into history is left alone; the timer re-arms when they return to the end).
 static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string Url)>? links = null,
     (ConsoleKey Key, string Hint)[]? actions = null, bool startAtEnd = false,
-    bool tryReadLinksInTerminal = false, string? startAtText = null)
+    bool tryReadLinksInTerminal = false, string? startAtText = null, TimeSpan? autoRefresh = null)
 {
     // With tryReadLinksInTerminal, O first attempts to read the link as an
     // article right here in the terminal (news-reader extraction), falling
@@ -3439,6 +3441,22 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
             : "";
         var extraHint = actions is { Length: > 0 } ? ", " + string.Join(", ", actions.Select(a => a.Hint)) : "";
         AnsiConsole.Markup($"[grey]{position} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}, ←/Esc/Backspace/Q back[/]");
+
+        if (autoRefresh is { } interval)
+        {
+            // Poll instead of blocking so idle time can trigger a refresh. The
+            // deadline restarts on every redraw, so any keypress re-arms it.
+            var deadline = DateTime.UtcNow + interval;
+            while (!Console.KeyAvailable)
+            {
+                if (DateTime.UtcNow >= deadline && offset == maxOffset)
+                {
+                    AnsiConsole.Clear();
+                    return ConsoleKey.F5;
+                }
+                Thread.Sleep(100);
+            }
+        }
 
         var key = Console.ReadKey(intercept: true);
         if (actions != null && actions.Any(a => a.Key == key.Key))
@@ -4490,7 +4508,9 @@ static async Task<List<SmsConversation>> ScrapeConversationsAsync(IPage page)
 
 // Opens one conversation, shows its messages in the pager, and lets the user
 // reply with R, react to a message with E, quote-reply to a message with T;
-// the thread refreshes after each action.
+// the thread refreshes after each action. It also refreshes itself after a
+// minute idle at the end of the thread (the page is live, so a rescrape picks
+// up new messages), and F5 refreshes on demand.
 static async Task ShowSmsConversationAsync(IPage page, int index, string name)
 {
     await AnsiConsole.Status().StartAsync("Opening conversation...", async _ =>
@@ -4527,9 +4547,13 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
             actions:
             [
                 (ConsoleKey.R, "R reply"), (ConsoleKey.E, "E react"),
-                (ConsoleKey.T, "T reply-to"), (ConsoleKey.A, "A archive")
-            ], startAtEnd: true, tryReadLinksInTerminal: true);
+                (ConsoleKey.T, "T reply-to"), (ConsoleKey.A, "A archive"),
+                (ConsoleKey.F5, "F5 refresh")
+            ], startAtEnd: true, tryReadLinksInTerminal: true,
+            autoRefresh: TimeSpan.FromMinutes(1));
         if (action == null) return;
+
+        if (action == ConsoleKey.F5) continue; // idle timeout or manual — rescrape the live thread
 
         if (action == ConsoleKey.E)
         {
