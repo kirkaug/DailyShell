@@ -167,6 +167,7 @@ static async Task ShowGamesMenuAsync()
     const string midi = "The Midi (crossword)";
     const string daily = "Daily crossword (full-size)";
     const string archive = "Archive — play a previous day...";
+    const string stats = "Stats — your NYT account";
     const string back = "<= Back to Main Menu";
 
     var lastIdx = 0;
@@ -175,7 +176,7 @@ static async Task ShowGamesMenuAsync()
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold blue]Games[/]");
 
-        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, archive, back };
+        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, archive, stats, back };
         var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
@@ -200,7 +201,206 @@ static async Task ShowGamesMenuAsync()
             await PlayCrosswordAsync("daily", "Daily Crossword");
         else if (options[idx] == archive)
             await ShowGamesArchiveMenuAsync();
+        else if (options[idx] == stats)
+            await ShowGamesStatsAsync();
     }
+}
+
+// Lifetime stats for every NYT game, from the account's games-state store (the
+// same blob NYT's own stats pages read). Rendered into the pager.
+static async Task ShowGamesStatsAsync()
+{
+    if (!NytBrowser.IsConnected)
+    {
+        AnsiConsole.MarkupLine(
+            "[yellow]Stats need your NYT account.[/] [grey]Connect it first via " +
+            "News & newsletters > Connect NYT account.[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    var json = await AnsiConsole.Status().StartAsync("Fetching your NYT game stats...",
+        async _ => await NytBrowser.GetGamesStatsAsync());
+    if (json == null)
+    {
+        AnsiConsole.MarkupLine("[red]Could not load your game stats from NYT.[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    IRenderable content;
+    try { content = BuildGamesStats(json); }
+    catch (Exception ex)
+    {
+        AppLog.Debug("stats parse", ex);
+        AnsiConsole.MarkupLine("[red]NYT returned stats in an unexpected shape.[/]\n");
+        PauseForKey();
+        return;
+    }
+    ShowInPager(content);
+    AnsiConsole.Clear();
+}
+
+// Renders the player.stats blob as one scrollable page, in the games-menu order.
+// Every field is optional — games the player never touched are skipped.
+static IRenderable BuildGamesStats(string statsJson)
+{
+    using var doc = JsonDocument.Parse(statsJson);
+    var s = doc.RootElement;
+
+    static int I(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? (int)v.GetDouble() : 0;
+    static double D(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : 0;
+    static string S(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+    static bool Obj(JsonElement e, string name, out JsonElement v) =>
+        e.TryGetProperty(name, out v) && v.ValueKind == JsonValueKind.Object;
+    static string Pct(int part, int whole) => whole > 0 ? $"{100.0 * part / whole:0}%" : "–";
+    static string Time(int secs) => secs >= 3600
+        ? $"{secs / 3600}:{secs / 60 % 60:00}:{secs % 60:00}" : $"{secs / 60}:{secs % 60:00}";
+    static string Bar(int n, int max, int width = 22)
+    {
+        if (max <= 0 || n <= 0) return "";
+        var w = Math.Max(1, (int)Math.Round((double)n / max * width));
+        return new string('█', w);
+    }
+
+    var lines = new List<string>
+    {
+        "[bold blue]Your NYT game stats[/] [dim](lifetime, from your NYT account)[/]",
+        "",
+    };
+
+    if (Obj(s, "wordle", out var w))
+    {
+        lines.Add("[bold green]Wordle[/]");
+        var played = 0;
+        if (Obj(w, "totalStats", out var t))
+        {
+            played = I(t, "gamesPlayed");
+            lines.Add($"  Played [bold]{played}[/]   Won [bold]{I(t, "gamesWon")}[/] ({Pct(I(t, "gamesWon"), played)})");
+        }
+        if (Obj(w, "calculatedStats", out var c))
+            lines.Add($"  Current streak [bold]{I(c, "currentStreak")}[/]   Max streak [bold]{I(c, "maxStreak")}[/]   Last won [dim]{S(c, "lastWonPrintDate")}[/]");
+        if (Obj(w, "totalStats", out var t2) && Obj(t2, "guesses", out var g))
+        {
+            string[] keys = ["1", "2", "3", "4", "5", "6", "fail"];
+            var counts = keys.Select(k => I(g, k)).ToArray();
+            var max = counts.Max();
+            lines.Add("  Guess distribution:");
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var label = keys[i] == "fail" ? "[red]X[/]" : keys[i];
+                var color = keys[i] == "fail" ? "red" : "green";
+                lines.Add($"    {label} [{color}]{Bar(counts[i], max)}[/] {counts[i]}");
+            }
+        }
+        lines.Add("");
+    }
+
+    if (Obj(s, "crossword_mini", out var mini) && I(mini, "bestTimeSeconds") > 0)
+    {
+        lines.Add("[bold blue]The Mini[/]");
+        lines.Add($"  Best time [bold]{Time(I(mini, "bestTimeSeconds"))}[/] on [dim]{S(mini, "bestDate")}[/]" +
+            " [grey](all NYT tracks for the Mini)[/]");
+        lines.Add("");
+    }
+
+    if (Obj(s, "crossword_midi", out var midi) && I(midi, "puzzlesStarted") > 0)
+    {
+        lines.Add("[bold blue]The Midi[/]");
+        lines.Add($"  Solved [bold]{I(midi, "puzzlesSolved")}[/] of {I(midi, "puzzlesStarted")} started ({D(midi, "solveRate"):P0})");
+        if (Obj(midi, "streaks", out var ms))
+            lines.Add($"  Current streak [bold]{I(ms, "current")}[/]   Longest [bold]{I(ms, "longest")}[/]");
+        lines.Add("");
+    }
+
+    if (Obj(s, "crossword_daily", out var xd) && I(xd, "puzzlesStarted") > 0)
+    {
+        lines.Add("[bold blue]Daily Crossword[/]");
+        lines.Add($"  Solved [bold]{I(xd, "puzzlesSolved")}[/] of {I(xd, "puzzlesStarted")} started ({D(xd, "solveRate"):P0})");
+        if (Obj(xd, "dailyStreaks", out var ds))
+            lines.Add($"  Current streak [bold]{I(ds, "current")}[/]   Longest [bold]{I(ds, "longest")}[/]");
+        if (Obj(xd, "dailyStats", out var days))
+        {
+            lines.Add("  [dim]Day        Best            Average   Solves[/]");
+            foreach (var day in new[] { "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday" })
+            {
+                if (!Obj(days, day, out var d)) continue;
+                var solves = I(d, "totalSolves");
+                var name = char.ToUpperInvariant(day[0]) + day[1..];
+                if (solves == 0) { lines.Add($"  {name,-9}  [dim]—[/]"); continue; }
+                var best = Obj(d, "best", out var b) && I(b, "timeSeconds") > 0
+                    ? $"{Time(I(b, "timeSeconds")),7} [dim]{S(b, "date")}[/]" : "      –           ";
+                lines.Add($"  {name,-9}  {best}   {Time(I(d, "avgTimeSeconds")),7}   {solves,4}");
+            }
+        }
+        lines.Add("");
+    }
+
+    if (Obj(s, "connections", out var cn))
+    {
+        lines.Add("[bold mediumpurple]Connections[/]");
+        var completed = I(cn, "puzzles_completed");
+        lines.Add($"  Completed [bold]{completed}[/]   Won [bold]{I(cn, "puzzles_won")}[/] ({Pct(I(cn, "puzzles_won"), completed)})");
+        lines.Add($"  Current streak [bold]{I(cn, "current_streak")}[/]   Max streak [bold]{I(cn, "max_streak")}[/]" +
+            (Obj(s, "cxns_prpl_frst", out var pf) ? $"   Purple first [bold]{I(pf, "purple_first_wins")}[/]" : ""));
+        if (Obj(cn, "mistakes", out var mk))
+        {
+            string[] keys = ["0", "1", "2", "3", "4"];
+            var counts = keys.Select(k => I(mk, k)).ToArray();
+            var max = counts.Max();
+            lines.Add("  Mistakes per win:");
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var label = keys[i] == "4" ? "[red]4 (lost)[/]" : keys[i] + "       ";
+                var color = keys[i] == "4" ? "red" : "mediumpurple";
+                lines.Add($"    {label} [{color}]{Bar(counts[i], max)}[/] {counts[i]}");
+            }
+        }
+        lines.Add("");
+    }
+
+    if (Obj(s, "strands", out var st))
+    {
+        lines.Add("[bold aqua]Strands[/]");
+        var started = I(st, "puzzles_started");
+        lines.Add($"  Completed [bold]{I(st, "puzzles_completed")}[/] of {started} started ({Pct(I(st, "puzzles_completed"), started)})");
+        lines.Add($"  Current streak [bold]{I(st, "current_streak")}[/]   Max streak [bold]{I(st, "max_streak")}[/]");
+        var extras = $"  No hints [bold]{I(st, "no_hints")}[/]   Spangram first [bold]{I(st, "spangram_first")}[/]";
+        if (Obj(s, "strands_found_theme_words", out var tw))
+            extras += $"   Theme words found [bold]{I(tw, "found_theme_words")}[/]";
+        lines.Add(extras);
+        lines.Add("");
+    }
+
+    if (Obj(s, "spelling_bee", out var bee))
+    {
+        lines.Add("[bold gold1]Spelling Bee[/]");
+        lines.Add($"  Puzzles [bold]{I(bee, "puzzles_started")}[/]   Words [bold]{I(bee, "total_words")}[/]   Pangrams [bold]{I(bee, "total_pangrams")}[/]");
+        if (Obj(bee, "longest_word", out var lw) && S(lw, "word").Length > 0)
+            lines.Add($"  Longest word [bold]{Markup.Escape(S(lw, "word").ToUpperInvariant())}[/] [dim]{S(lw, "print_date")}[/]");
+        if (Obj(bee, "ranks", out var rk))
+        {
+            // NYT tier order, best first; only tiers actually reached.
+            string[] tiers = ["Queen Bee", "Genius", "Amazing", "Great", "Nice", "Solid", "Good", "Moving Up", "Good Start", "Beginner"];
+            var reached = tiers.Select(t => (Tier: t, Count: I(rk, t))).Where(x => x.Count > 0).ToList();
+            if (reached.Count > 0)
+            {
+                var max = reached.Max(x => x.Count);
+                lines.Add("  Ranks reached:");
+                foreach (var (tier, count) in reached)
+                {
+                    var color = tier is "Queen Bee" or "Genius" ? "gold1" : "yellow";
+                    lines.Add($"    {tier,-10} [{color}]{Bar(count, max)}[/] {count}");
+                }
+            }
+        }
+        lines.Add("");
+    }
+
+    return new Rows(lines.Select(l => new Markup(l)));
 }
 
 // Archive flow: pick a game, then a past date. Wordle/Connections/Strands and the
@@ -5535,6 +5735,34 @@ static class NytBrowser
                 } catch (e) { return ''; }
             }", new[] { game, puzzleId });
             return string.IsNullOrEmpty(json) ? null : json;
+        }
+        catch (Exception ex) { AppLog.Debug("returned null", ex); return null; }
+        finally { _gate.Release(); }
+    }
+
+    // Lifetime stats for ALL games in one call: the games-state store returns a
+    // player.stats blob (Wordle, Spelling Bee, Connections, Strands, crosswords)
+    // on any /latests request. NYT's own stats pages read this same blob — the
+    // old svc/crosswords stats-and-streaks API is gone (404). Null on failure.
+    public static async Task<string?> GetGamesStatsAsync()
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            IPage? page;
+            try { page = await EnsurePageAsync(); } catch (Exception ex) { AppLog.Debug("returned null", ex); return null; }
+            if (page == null) return null;
+            await EnsureNytOriginAsync(page);
+
+            var json = await page.EvaluateAsync<string>(@"async () => {
+                try {
+                    const r = await fetch('https://www.nytimes.com/svc/games/state/wordleV2/latests', { credentials: 'include' });
+                    if (!r.ok) return '';
+                    const j = await r.json();
+                    return JSON.stringify((j.player && j.player.stats) || {});
+                } catch (e) { return ''; }
+            }");
+            return string.IsNullOrEmpty(json) || json == "{}" ? null : json;
         }
         catch (Exception ex) { AppLog.Debug("returned null", ex); return null; }
         finally { _gate.Release(); }
