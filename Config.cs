@@ -50,7 +50,8 @@ static class Config
             "refresh, click a request to discord.com/api (e.g. 'science' or 'messages'),",
             "and copy the value of the 'Authorization' request header.",
             "Caution: Discord's terms forbid automating a user account. This app only",
-            "reads messages and marks channels seen, but the risk is yours.",
+            "reads messages, marks channels seen, and posts what you type here,",
+            "but the risk is yours.",
         ], false),
         new("display", "Main menu display",
         [

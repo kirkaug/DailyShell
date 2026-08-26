@@ -35,9 +35,9 @@ read threads, reply, react, and archive.
 
 **Discord** — see your servers and DMs with unread/mention badges, open a
 channel to read messages starting from a NEW MESSAGES divider (or the bottom if
-you're caught up), load older history, and mark channels read (syncs back to
-your other Discord clients). Uses your own account token; see the caution
-below.
+you're caught up), load older history, post messages, and mark channels read
+(read state syncs back to your other Discord clients). Uses your own account
+token; see the caution below.
 
 **Games** — the NYT games, playable at the keyboard: Wordle, The Mini/The
 Midi/full-size Daily crossword, Connections, Strands, and Spelling Bee.
@@ -89,8 +89,8 @@ read).
 
 - **Discord**: the Discord section authenticates with your personal user
   token. Discord's Terms of Service forbid automating a user account; this app
-  keeps usage minimal (read messages, send read-receipts), but use it at your
-  own discretion.
+  keeps usage minimal (read messages, send read-receipts, post what you type),
+  but use it at your own discretion.
 - **Credentials** in `config.txt` (app passwords, cookies, tokens) are stored
   in plain text next to the exe — keep the folder private and don't commit it
   anywhere.

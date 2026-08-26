@@ -249,6 +249,16 @@ static class DiscordApi
         SendAsync(HttpMethod.Post, $"{ApiBase}/channels/{channelId}/messages/{messageId}/ack",
             """{"token":null}""");
 
+    // Posts a plain text message; returns the new message's id so the caller
+    // can ack it (your own post shouldn't leave the channel unread).
+    public static async Task<ulong> SendMessageAsync(string channelId, string content)
+    {
+        var body = JsonSerializer.Serialize(new { content });
+        using var doc = JsonDocument.Parse(
+            await SendAsync(HttpMethod.Post, $"{ApiBase}/channels/{channelId}/messages", body));
+        return Snowflake(doc.RootElement, "id");
+    }
+
     static async Task<string> SendAsync(HttpMethod method, string url, string? jsonBody = null)
     {
         var request = new HttpRequestMessage(method, url);
@@ -258,7 +268,8 @@ static class DiscordApi
         if (response.StatusCode == HttpStatusCode.Unauthorized)
             throw new InvalidOperationException("Discord rejected the token — update it in Settings > Discord.");
         if (response.StatusCode == HttpStatusCode.Forbidden)
-            throw new InvalidOperationException("Discord says this account can't access that channel.");
+            throw new InvalidOperationException(
+                "Discord refused — this account can't view or post in that channel.");
         if ((int)response.StatusCode == 429)
             throw new InvalidOperationException("Discord rate-limited the request — wait a moment and try again.");
         response.EnsureSuccessStatusCode();

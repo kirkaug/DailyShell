@@ -4810,7 +4810,8 @@ static async Task ShowDiscordAsync()
             "[yellow]No Discord token configured.[/]\n\n" +
             "[grey]Add your user token under Settings > Discord (instructions are shown there).\n" +
             "Heads up: Discord's terms forbid automating a user account. This section only\n" +
-            "reads messages and marks channels seen, but use it at your own discretion.[/]\n");
+            "reads messages, marks channels seen, and posts what you type — but use it\n" +
+            "at your own discretion.[/]\n");
         PauseForKey();
         return;
     }
@@ -4952,11 +4953,43 @@ static async Task ShowDiscordChannelAsync(DiscordState state, DiscordGuild guild
             Expand = true
         };
 
-        var actions = new List<(ConsoleKey Key, string Hint)> { (ConsoleKey.L, "L older") };
+        var actions = new List<(ConsoleKey Key, string Hint)>
+        {
+            (ConsoleKey.R, "R post"), (ConsoleKey.L, "L older")
+        };
         if (dividerShown) actions.Add((ConsoleKey.M, "M mark read"));
 
         var key = ShowInPager(panel, links, actions.ToArray(),
             startAtEnd: !dividerShown, startAtText: dividerShown ? "NEW MESSAGES" : null);
+
+        if (key == ConsoleKey.R)
+        {
+            var post = PromptReplyLine(
+                $"[green]Post in {Markup.Escape(title)}[/] [grey](leave blank to cancel):[/]");
+            if (post.Length == 0) continue;
+            try
+            {
+                var postedId = await AnsiConsole.Status().StartAsync("Posting...",
+                    async _ => await DiscordApi.SendMessageAsync(ch.Id, post));
+
+                // Match the official client: your own post acks the channel.
+                if (postedId > 0)
+                {
+                    try { await DiscordApi.AckAsync(ch.Id, postedId); }
+                    catch (Exception ex) { AppLog.Debug("discord ack after post", ex); }
+                    lastAcked = postedId;
+                    state.ReadStates[ch.Id] = (lastAcked, 0);
+                }
+                // Re-fetch so the new post (and anything that arrived since) shows.
+                messages = await FetchAsync("Refreshing...") ?? messages;
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Couldn't post:[/] {Markup.Escape(ex.Message)}\n");
+                PauseForKey();
+            }
+            continue;
+        }
 
         if (key == ConsoleKey.L && messages.Count > 0)
         {
