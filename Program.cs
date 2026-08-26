@@ -166,6 +166,7 @@ static async Task ShowGamesMenuAsync()
     const string mini = "The Mini (crossword)";
     const string midi = "The Midi (crossword)";
     const string daily = "Daily crossword (full-size)";
+    const string archive = "Archive — play a previous day...";
     const string back = "<= Back to Main Menu";
 
     var lastIdx = 0;
@@ -174,7 +175,7 @@ static async Task ShowGamesMenuAsync()
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold blue]Games[/]");
 
-        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, back };
+        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, archive, back };
         var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
@@ -197,6 +198,89 @@ static async Task ShowGamesMenuAsync()
             await PlayCrosswordAsync("midi", "The Midi");
         else if (options[idx] == daily)
             await PlayCrosswordAsync("daily", "Daily Crossword");
+        else if (options[idx] == archive)
+            await ShowGamesArchiveMenuAsync();
+    }
+}
+
+// Archive flow: pick a game, then a past date. Wordle/Connections/Strands and the
+// crosswords are fetched straight from NYT's dated endpoints; Spelling Bee is
+// limited to the ~two weeks NYT embeds in its page.
+static async Task ShowGamesArchiveMenuAsync()
+{
+    const string spellingBee = "Spelling Bee (last two weeks)";
+    const string wordle = "Wordle";
+    const string connections = "Connections";
+    const string strands = "Strands";
+    const string mini = "The Mini (crossword)";
+    const string midi = "The Midi (crossword)";
+    const string daily = "Daily crossword (full-size)";
+    const string back = "<= Back to Games";
+
+    var lastIdx = 0;
+    while (true)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold blue]Games archive[/] [dim](previous days)[/]");
+
+        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, back };
+        var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
+        if (idx < 0 || options[idx] == back)
+        {
+            AnsiConsole.Clear();
+            return;
+        }
+        lastIdx = idx;
+
+        if (options[idx] == spellingBee)
+        {
+            await PlaySpellingBeeArchiveAsync();
+            continue;
+        }
+
+        var date = PromptArchiveDate();
+        if (date == null) continue;
+
+        if (options[idx] == wordle)
+            await PlayWordleAsync(date);
+        else if (options[idx] == connections)
+            await PlayConnectionsAsync(date);
+        else if (options[idx] == strands)
+            await PlayStrandsAsync(date);
+        else if (options[idx] == mini)
+            await PlayCrosswordAsync("mini", "The Mini", date);
+        else if (options[idx] == midi)
+            await PlayCrosswordAsync("midi", "The Midi", date);
+        else if (options[idx] == daily)
+            await PlayCrosswordAsync("daily", "Daily Crossword", date);
+    }
+}
+
+// Pick a past date for an archived game: the last two weeks as a quick list, or
+// any typed YYYY-MM-DD. NYT puzzles roll over at US-Eastern midnight, so "past"
+// is judged in ET. Returns null if cancelled.
+static string? PromptArchiveDate()
+{
+    var etToday = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow,
+        TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")).Date;
+    const string custom = "Enter another date (YYYY-MM-DD)...";
+
+    var days = Enumerable.Range(1, 14).Select(i => etToday.AddDays(-i)).ToList();
+    var options = days.Select(d => d.ToString("yyyy-MM-dd  (ddd)")).ToList();
+    options.Add(custom);
+
+    var idx = PromptMenu("[green]Pick a date:[/]", options, 16);
+    if (idx < 0) return null;
+    if (idx < days.Count) return days[idx].ToString("yyyy-MM-dd");
+
+    while (true)
+    {
+        var input = PromptReplyLine("[green]Date (YYYY-MM-DD, blank to cancel):[/]");
+        if (input.Length == 0) return null;
+        if (DateTime.TryParseExact(input, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var d) && d.Date < etToday)
+            return d.ToString("yyyy-MM-dd");
+        AnsiConsole.MarkupLine("[yellow]Enter a past date as YYYY-MM-DD.[/]");
     }
 }
 
@@ -900,9 +984,10 @@ static void PauseForKey()
 // Terminal NYT Spelling Bee. Fetches the day's puzzle (letters + answer list) once,
 // caches it, and validates/scores entirely offline. Type words; blank line shuffles;
 // ":q" quits. Only the puzzle's functional word data is used — no NYT text.
-static async Task PlaySpellingBeeAsync()
+// Pass an archive puzzle (from the games archive menu) to play a previous day.
+static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
 {
-    var puzzle = await AnsiConsole.Status().StartAsync("Fetching today's Spelling Bee...",
+    var puzzle = archivePuzzle ?? await AnsiConsole.Status().StartAsync("Fetching today's Spelling Bee...",
         async _ => await FetchSpellingBeeAsync());
     if (puzzle == null)
     {
@@ -1173,20 +1258,46 @@ static IRenderable BuildBeeHints(SpellingBeePuzzle puzzle, HashSet<string> found
 }
 
 // Local progress: found words for a given puzzle date, in spellingbee-progress.json.
+// The word-game progress files map "yyyy-MM-dd" -> record, so archived days keep
+// their own saves. Older builds stored a single record with the date inline
+// (`dateProp`); that shape is folded in as one entry so old saves survive.
+static Dictionary<string, JsonElement> LoadDateKeyedProgress(string path, string dateProp)
+{
+    var map = new Dictionary<string, JsonElement>();
+    try
+    {
+        if (!File.Exists(path)) return map;
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        var root = doc.RootElement;
+        if (root.TryGetProperty(dateProp, out var d) && d.ValueKind == JsonValueKind.String)
+            map[d.GetString() ?? ""] = root.Clone();
+        else
+            foreach (var p in root.EnumerateObject()) map[p.Name] = p.Value.Clone();
+    }
+    catch (Exception ex) { AppLog.Debug("io", ex); }
+    return map;
+}
+
+static void SaveDateKeyedProgress(string path, string dateProp, string date, object record)
+{
+    try
+    {
+        var map = LoadDateKeyedProgress(path, dateProp);
+        map[date] = JsonSerializer.SerializeToElement(record);
+        File.WriteAllText(path, JsonSerializer.Serialize(map));
+    }
+    catch (Exception ex) { AppLog.Debug("io", ex); }
+}
+
 static HashSet<string> LoadBeeProgress(string printDate)
 {
     var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     try
     {
-        var path = Paths.Data("spellingbee-progress.json");
-        if (!File.Exists(path)) return set;
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
-        if (doc.RootElement.TryGetProperty("printDate", out var d) && d.GetString() == printDate &&
-            doc.RootElement.TryGetProperty("found", out var f))
-        {
+        var map = LoadDateKeyedProgress(Paths.Data("spellingbee-progress.json"), "printDate");
+        if (map.TryGetValue(printDate, out var rec) && rec.TryGetProperty("found", out var f))
             foreach (var w in f.EnumerateArray())
                 if (w.GetString() is { } s) set.Add(s);
-        }
     }
     catch { /* corrupt/missing save — start fresh */ }
     return set;
@@ -1194,13 +1305,8 @@ static HashSet<string> LoadBeeProgress(string printDate)
 
 static void SaveBeeProgress(string printDate, HashSet<string> found)
 {
-    try
-    {
-        var path = Paths.Data("spellingbee-progress.json");
-        var json = JsonSerializer.Serialize(new { printDate, found = found.ToArray() });
-        File.WriteAllText(path, json);
-    }
-    catch { /* best effort */ }
+    SaveDateKeyedProgress(Paths.Data("spellingbee-progress.json"), "printDate", printDate,
+        new { found = found.ToArray() });
 }
 
 // NYT scoring: 4-letter words = 1 point; longer = one point per letter; pangrams
@@ -1267,6 +1373,62 @@ static async Task<SpellingBeePuzzle?> FetchSpellingBeeAsync()
     return null;
 }
 
+// The Spelling Bee archive picker. NYT's page embeds roughly the last two weeks
+// of full puzzles (pastPuzzles.thisWeek/lastWeek); pick one and play it normally.
+static async Task PlaySpellingBeeArchiveAsync()
+{
+    var puzzles = await AnsiConsole.Status().StartAsync("Fetching the Spelling Bee archive...",
+        async _ => await FetchSpellingBeeArchiveAsync());
+    if (puzzles.Count == 0)
+    {
+        AnsiConsole.MarkupLine("[red]Could not load past Spelling Bee puzzles.[/] [grey](NYT only exposes about two weeks of them.)[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    var options = puzzles.Select(p => p.DisplayDate).ToList();
+    var idx = PromptMenu("[green]Pick a day:[/]", options, 15);
+    if (idx < 0) return;
+    await PlaySpellingBeeAsync(puzzles[idx]);
+}
+
+// Past Spelling Bee puzzles from the same window.gameData blob as today's:
+// yesterday + pastPuzzles.thisWeek/lastWeek, minus today, newest first.
+static async Task<List<SpellingBeePuzzle>> FetchSpellingBeeArchiveAsync()
+{
+    var list = new List<SpellingBeePuzzle>();
+    try
+    {
+        var html = await Web.GetStringAsync("https://www.nytimes.com/puzzles/spelling-bee");
+        var m = Regex.Match(html, @"window\.gameData\s*=\s*(\{.*?\})\s*</script>", RegexOptions.Singleline);
+        if (!m.Success) return list;
+
+        using var doc = JsonDocument.Parse(m.Groups[1].Value);
+        var root = doc.RootElement;
+        var todayDate = root.TryGetProperty("today", out var t) &&
+            t.TryGetProperty("printDate", out var tp) ? tp.GetString() : null;
+
+        var seen = new HashSet<string>();
+        void Add(JsonElement el)
+        {
+            if (!el.TryGetProperty("printDate", out var pd)) return;
+            var date = pd.GetString() ?? "";
+            if (date.Length == 0 || date == todayDate || !seen.Add(date)) return;
+            list.Add(ParseBee(el));
+        }
+
+        if (root.TryGetProperty("pastPuzzles", out var past))
+            foreach (var week in new[] { "thisWeek", "lastWeek" })
+                if (past.TryGetProperty(week, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                    foreach (var el in arr.EnumerateArray()) Add(el);
+        if (root.TryGetProperty("yesterday", out var y)) Add(y);
+
+        list.Sort((a, b) => string.CompareOrdinal(b.PrintDate, a.PrintDate));
+    }
+    catch (Exception ex) { AppLog.Debug("bee archive", ex); }
+    return list;
+}
+
 static SpellingBeePuzzle ParseBee(JsonElement today)
 {
     string[] Arr(string name) => today.GetProperty(name).EnumerateArray().Select(e => e.GetString() ?? "").ToArray();
@@ -1285,10 +1447,11 @@ static SpellingBeePuzzle ParseBee(JsonElement today)
 
 // Terminal NYT Connections. Group the 16 words into 4 sets of 4 by entering their
 // numbers. Four mistakes ends it. Public data; cached; local progress.
-static async Task PlayConnectionsAsync()
+static async Task PlayConnectionsAsync(string? archiveDate = null)
 {
-    var puzzle = await AnsiConsole.Status().StartAsync("Fetching today's Connections...",
-        async _ => await FetchConnectionsAsync());
+    var puzzle = await AnsiConsole.Status().StartAsync(
+        archiveDate == null ? "Fetching today's Connections..." : $"Fetching Connections for {archiveDate}...",
+        async _ => await FetchConnectionsAsync(archiveDate));
     if (puzzle == null)
     {
         AnsiConsole.MarkupLine("[red]Could not load Connections (and no cached copy is available).[/]\n");
@@ -1465,17 +1628,23 @@ static string BuildConnectionsGameData(List<int>[] categoryPositions, HashSet<in
     });
 }
 
-static async Task<ConnectionsPuzzle?> FetchConnectionsAsync()
+static async Task<ConnectionsPuzzle?> FetchConnectionsAsync(string? archiveDate = null)
 {
     var cachePath = Paths.Data("connections-cache.json");
-    var date = DateTime.Now.ToString("yyyy-MM-dd");
+    var date = archiveDate ?? DateTime.Now.ToString("yyyy-MM-dd");
     try
     {
         var json = await Web.GetStringAsync($"https://www.nytimes.com/svc/connections/v2/{date}.json");
         var p = ParseConnections(json);
-        if (p != null) { try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); } return p; }
+        if (p != null)
+        {
+            if (archiveDate == null)
+                try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); }
+            return p;
+        }
     }
     catch (Exception ex) { AppLog.Debug("io", ex); }
+    if (archiveDate != null) return null; // never serve today's cache for a past date
     if (File.Exists(cachePath))
     {
         try { return ParseConnections(await File.ReadAllTextAsync(cachePath)); } catch (Exception ex) { AppLog.Debug("io", ex); }
@@ -1514,16 +1683,12 @@ static (HashSet<int> Solved, int Mistakes) LoadConnectionsProgress(string date)
 {
     try
     {
-        var path = Paths.Data("connections-progress.json");
-        if (File.Exists(path))
+        var map = LoadDateKeyedProgress(Paths.Data("connections-progress.json"), "date");
+        if (map.TryGetValue(date, out var rec))
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            if (doc.RootElement.TryGetProperty("date", out var d) && d.GetString() == date)
-            {
-                var solved = doc.RootElement.GetProperty("solved").EnumerateArray().Select(e => e.GetInt32()).ToHashSet();
-                var mistakes = doc.RootElement.GetProperty("mistakes").GetInt32();
-                return (solved, mistakes);
-            }
+            var solved = rec.GetProperty("solved").EnumerateArray().Select(e => e.GetInt32()).ToHashSet();
+            var mistakes = rec.GetProperty("mistakes").GetInt32();
+            return (solved, mistakes);
         }
     }
     catch (Exception ex) { AppLog.Debug("io", ex); }
@@ -1532,20 +1697,17 @@ static (HashSet<int> Solved, int Mistakes) LoadConnectionsProgress(string date)
 
 static void SaveConnectionsProgress(string date, HashSet<int> solved, int mistakes)
 {
-    try
-    {
-        var path = Paths.Data("connections-progress.json");
-        File.WriteAllText(path, JsonSerializer.Serialize(new { date, solved = solved.ToArray(), mistakes }));
-    }
-    catch (Exception ex) { AppLog.Debug("io", ex); }
+    SaveDateKeyedProgress(Paths.Data("connections-progress.json"), "date", date,
+        new { solved = solved.ToArray(), mistakes });
 }
 
 // Terminal NYT Strands. Type theme words you spot in the board; the spangram spans
 // it. Found words light up on the grid. Public data; cached; local progress.
-static async Task PlayStrandsAsync()
+static async Task PlayStrandsAsync(string? archiveDate = null)
 {
-    var puzzle = await AnsiConsole.Status().StartAsync("Fetching today's Strands...",
-        async _ => await FetchStrandsAsync());
+    var puzzle = await AnsiConsole.Status().StartAsync(
+        archiveDate == null ? "Fetching today's Strands..." : $"Fetching Strands for {archiveDate}...",
+        async _ => await FetchStrandsAsync(archiveDate));
     if (puzzle == null)
     {
         AnsiConsole.MarkupLine("[red]Could not load Strands (and no cached copy is available).[/]\n");
@@ -1688,17 +1850,23 @@ static string BuildStrandsGameData(StrandsPuzzle puzzle, HashSet<string> found, 
     });
 }
 
-static async Task<StrandsPuzzle?> FetchStrandsAsync()
+static async Task<StrandsPuzzle?> FetchStrandsAsync(string? archiveDate = null)
 {
     var cachePath = Paths.Data("strands-cache.json");
-    var date = DateTime.Now.ToString("yyyy-MM-dd");
+    var date = archiveDate ?? DateTime.Now.ToString("yyyy-MM-dd");
     try
     {
         var json = await Web.GetStringAsync($"https://www.nytimes.com/svc/strands/v2/{date}.json");
         var p = ParseStrands(json);
-        if (p != null) { try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); } return p; }
+        if (p != null)
+        {
+            if (archiveDate == null)
+                try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); }
+            return p;
+        }
     }
     catch (Exception ex) { AppLog.Debug("io", ex); }
+    if (archiveDate != null) return null; // never serve today's cache for a past date
     if (File.Exists(cachePath))
     {
         try { return ParseStrands(await File.ReadAllTextAsync(cachePath)); } catch (Exception ex) { AppLog.Debug("io", ex); }
@@ -1743,14 +1911,10 @@ static HashSet<string> LoadStrandsProgress(string date)
     var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     try
     {
-        var path = Paths.Data("strands-progress.json");
-        if (File.Exists(path))
-        {
-            using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            if (doc.RootElement.TryGetProperty("date", out var d) && d.GetString() == date)
-                foreach (var w in doc.RootElement.GetProperty("found").EnumerateArray())
-                    if (w.GetString() is { } s) set.Add(s);
-        }
+        var map = LoadDateKeyedProgress(Paths.Data("strands-progress.json"), "date");
+        if (map.TryGetValue(date, out var rec) && rec.TryGetProperty("found", out var f))
+            foreach (var w in f.EnumerateArray())
+                if (w.GetString() is { } s) set.Add(s);
     }
     catch (Exception ex) { AppLog.Debug("io", ex); }
     return set;
@@ -1758,19 +1922,15 @@ static HashSet<string> LoadStrandsProgress(string date)
 
 static void SaveStrandsProgress(string date, HashSet<string> found)
 {
-    try
-    {
-        var path = Paths.Data("strands-progress.json");
-        File.WriteAllText(path, JsonSerializer.Serialize(new { date, found = found.ToArray() }));
-    }
-    catch (Exception ex) { AppLog.Debug("io", ex); }
+    SaveDateKeyedProgress(Paths.Data("strands-progress.json"), "date", date,
+        new { found = found.ToArray() });
 }
 
 // Terminal NYT crossword (The Mini / The Midi). Fetches the day's puzzle through
 // the signed-in nyt-profile (the puzzle data needs auth), caches it, and saves your
 // letters locally. Arrow keys move, letters fill, Tab flips across/down, Esc = menu.
 // Crossword progress isn't in NYT's synced game store, so this is local-only.
-static async Task PlayCrosswordAsync(string publishType, string title)
+static async Task PlayCrosswordAsync(string publishType, string title, string? archiveDate = null)
 {
     if (!NytBrowser.IsConnected)
     {
@@ -1781,11 +1941,14 @@ static async Task PlayCrosswordAsync(string publishType, string title)
         return;
     }
 
-    var puzzle = await AnsiConsole.Status().StartAsync($"Fetching {title}...",
-        async _ => await FetchCrosswordAsync(publishType, title));
+    var puzzle = await AnsiConsole.Status().StartAsync(
+        archiveDate == null ? $"Fetching {title}..." : $"Fetching {title} for {archiveDate}...",
+        async _ => await FetchCrosswordAsync(publishType, title, archiveDate));
     if (puzzle == null)
     {
-        AnsiConsole.MarkupLine($"[red]Could not load {Markup.Escape(title)} (and no cached copy is available).[/]\n");
+        AnsiConsole.MarkupLine(archiveDate == null
+            ? $"[red]Could not load {Markup.Escape(title)} (and no cached copy is available).[/]\n"
+            : $"[red]Could not load {Markup.Escape(title)} for {archiveDate} (there may be no puzzle for that date).[/]\n");
         PauseForKey();
         return;
     }
@@ -1950,11 +2113,14 @@ static void CrosswordCheck(Crossword p, string[] entry, int cur)
 
 // Fetches the latest puzzle for a type, cached to disk for offline replay. The Midi
 // has no id in the v3 list API — it's fetched directly by the slug "midi"; the Mini
-// and Daily are looked up by id from the public listing.
-static async Task<Crossword?> FetchCrosswordAsync(string publishType, string title)
+// and Daily are looked up by id from the public listing. An archive date fetches
+// that day's puzzle via the dated slug (v6/puzzle/{type}/{date}.json) instead; the
+// cache is never read or written for archive plays (it only holds today's puzzle).
+static async Task<Crossword?> FetchCrosswordAsync(string publishType, string title, string? archiveDate = null)
 {
     var cachePath = Paths.Data($"crossword-{publishType}-cache.json");
-    var bySlug = publishType is "midi";
+    var bySlug = archiveDate != null || publishType is "midi";
+    var slug = archiveDate != null ? $"{publishType}/{archiveDate}" : publishType;
 
     try
     {
@@ -1964,8 +2130,8 @@ static async Task<Crossword?> FetchCrosswordAsync(string publishType, string tit
         if (bySlug)
         {
             puzzleJson = await NytBrowser.FetchJsonAsync(
-                $"https://www.nytimes.com/svc/crosswords/v6/puzzle/{publishType}.json");
-            (id, printDate) = ("", "");
+                $"https://www.nytimes.com/svc/crosswords/v6/puzzle/{slug}.json");
+            (id, printDate) = ("", archiveDate ?? "");
             if (puzzleJson != null)
             {
                 using var d = JsonDocument.Parse(puzzleJson);
@@ -1974,7 +2140,7 @@ static async Task<Crossword?> FetchCrosswordAsync(string publishType, string tit
                 if (d.RootElement.TryGetProperty("publicationDate", out var pdd)) printDate = pdd.GetString() ?? "";
                 else if (d.RootElement.TryGetProperty("printDate", out var pdd2)) printDate = pdd2.GetString() ?? "";
             }
-            if (id.Length == 0) id = publishType; // stable local-save key fallback
+            if (id.Length == 0) id = slug.Replace('/', '-'); // stable local-save key fallback
         }
         else
         {
@@ -1992,12 +2158,15 @@ static async Task<Crossword?> FetchCrosswordAsync(string publishType, string tit
             var parsed = ParseCrossword(puzzleJson, id, printDate, title);
             if (parsed != null)
             {
-                try { await File.WriteAllTextAsync(cachePath, JsonSerializer.Serialize(new { id, printDate, title, json = puzzleJson })); } catch (Exception ex) { AppLog.Debug("io", ex); }
+                if (archiveDate == null)
+                    try { await File.WriteAllTextAsync(cachePath, JsonSerializer.Serialize(new { id, printDate, title, json = puzzleJson })); } catch (Exception ex) { AppLog.Debug("io", ex); }
                 return parsed;
             }
         }
     }
     catch (Exception ex) { AppLog.Debug("crossword fetch", ex); /* fall through to cache */ }
+
+    if (archiveDate != null) return null; // never serve today's cache for a past date
 
     if (File.Exists(cachePath))
     {
@@ -2103,10 +2272,11 @@ static void SaveCrosswordProgress(string id, string[] entry)
 // caches it, persists guesses locally, and syncs with your NYT account when a
 // profile is connected. Guesses are validated as any 5 letters (NYT's exact
 // allowed-word list isn't cleanly fetchable).
-static async Task PlayWordleAsync()
+static async Task PlayWordleAsync(string? archiveDate = null)
 {
-    var puzzle = await AnsiConsole.Status().StartAsync("Fetching today's Wordle...",
-        async _ => await FetchWordleAsync());
+    var puzzle = await AnsiConsole.Status().StartAsync(
+        archiveDate == null ? "Fetching today's Wordle..." : $"Fetching Wordle for {archiveDate}...",
+        async _ => await FetchWordleAsync(archiveDate));
     if (puzzle == null)
     {
         AnsiConsole.MarkupLine("[red]Could not load the Wordle puzzle (and no cached copy is available).[/]\n");
@@ -2293,8 +2463,10 @@ static string RenderWordleKeyboard(Dictionary<char, string> keyState)
     return sb.ToString().TrimEnd('\n');
 }
 
-// Fetches today's Wordle solution from the public /svc/ endpoint, cached for offline.
-static async Task<WordlePuzzle?> FetchWordleAsync()
+// Fetches the Wordle solution from the public /svc/ endpoint, cached for offline.
+// With no date, today's (ET) puzzle; a past date fetches that day's from the
+// archive directly (no cache involvement — the cache only ever holds today's).
+static async Task<WordlePuzzle?> FetchWordleAsync(string? archiveDate = null)
 {
     var cachePath = Paths.Data("wordle-cache.json");
 
@@ -2302,15 +2474,20 @@ static async Task<WordlePuzzle?> FetchWordleAsync()
     var etNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow,
         TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
 
-    foreach (var date in new[] { etNow, etNow.AddDays(-1) }) // fall back a day near rollover
+    var dates = archiveDate != null
+        ? new[] { archiveDate }
+        : new[] { etNow.ToString("yyyy-MM-dd"), etNow.AddDays(-1).ToString("yyyy-MM-dd") }; // fall back a day near rollover
+
+    foreach (var date in dates)
     {
         try
         {
             var json = await Web.GetStringAsync(
-                $"https://www.nytimes.com/svc/wordle/v2/{date:yyyy-MM-dd}.json");
+                $"https://www.nytimes.com/svc/wordle/v2/{date}.json");
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); }
+            if (archiveDate == null)
+                try { await File.WriteAllTextAsync(cachePath, json); } catch (Exception ex) { AppLog.Debug("io", ex); }
             return new WordlePuzzle(
                 (root.GetProperty("solution").GetString() ?? "").ToLowerInvariant(),
                 root.GetProperty("print_date").GetString() ?? "",
@@ -2318,6 +2495,8 @@ static async Task<WordlePuzzle?> FetchWordleAsync()
         }
         catch { /* try previous day, then cache */ }
     }
+
+    if (archiveDate != null) return null; // never serve today's cache for a past date
 
     if (File.Exists(cachePath))
     {
@@ -2403,17 +2582,13 @@ static (List<string> Guesses, string Status) LoadWordleProgress(string printDate
 {
     try
     {
-        var path = Paths.Data("wordle-progress.json");
-        if (File.Exists(path))
+        var map = LoadDateKeyedProgress(Paths.Data("wordle-progress.json"), "printDate");
+        if (map.TryGetValue(printDate, out var rec))
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            if (doc.RootElement.TryGetProperty("printDate", out var d) && d.GetString() == printDate)
-            {
-                var g = doc.RootElement.GetProperty("guesses").EnumerateArray()
-                    .Select(e => e.GetString() ?? "").Where(s => s.Length == 5).ToList();
-                var s = doc.RootElement.TryGetProperty("status", out var st) ? st.GetString() ?? "IN_PROGRESS" : "IN_PROGRESS";
-                return (g, s);
-            }
+            var g = rec.GetProperty("guesses").EnumerateArray()
+                .Select(e => e.GetString() ?? "").Where(s => s.Length == 5).ToList();
+            var s = rec.TryGetProperty("status", out var st) ? st.GetString() ?? "IN_PROGRESS" : "IN_PROGRESS";
+            return (g, s);
         }
     }
     catch (Exception ex) { AppLog.Debug("io", ex); }
@@ -2422,12 +2597,8 @@ static (List<string> Guesses, string Status) LoadWordleProgress(string printDate
 
 static void SaveWordleProgress(string printDate, List<string> guesses, string status)
 {
-    try
-    {
-        var path = Paths.Data("wordle-progress.json");
-        File.WriteAllText(path, JsonSerializer.Serialize(new { printDate, guesses, status }));
-    }
-    catch (Exception ex) { AppLog.Debug("io", ex); }
+    SaveDateKeyedProgress(Paths.Data("wordle-progress.json"), "printDate", printDate,
+        new { guesses, status });
 }
 
 // Recognizes subreddit input: "r/stlouis", "/r/stlouis", or a reddit.com subreddit URL.
