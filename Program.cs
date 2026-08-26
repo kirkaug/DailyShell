@@ -3396,9 +3396,13 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
 // null on a normal exit. With autoRefresh set, returns ConsoleKey.F5 after that
 // much idle time — but only while the view sits at the end (a reader scrolled up
 // into history is left alone; the timer re-arms when they return to the end).
+// With loadMoreAtTop, scrolling up while already at the top returns ConsoleKey.F6
+// so the caller can fetch older content; startAtLine reopens at that line so the
+// view can stay put after the content grows above it.
 static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string Url)>? links = null,
     (ConsoleKey Key, string Hint)[]? actions = null, bool startAtEnd = false,
-    bool tryReadLinksInTerminal = false, string? startAtText = null, TimeSpan? autoRefresh = null)
+    bool tryReadLinksInTerminal = false, string? startAtText = null, TimeSpan? autoRefresh = null,
+    int? startAtLine = null, bool loadMoreAtTop = false)
 {
     // With tryReadLinksInTerminal, O first attempts to read the link as an
     // article right here in the terminal (news-reader extraction), falling
@@ -3419,6 +3423,7 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
         var at = lines.FindIndex(l => Regex.Replace(l, "\x1b\\[[0-9;]*m", "").Contains(startAtText));
         if (at >= 0) offset = Math.Max(0, at - 2);
     }
+    if (startAtLine is { } sl) offset = sl;
     while (true)
     {
         var height = Math.Max(1, Console.WindowHeight - 1); // bottom row holds the key hints
@@ -3440,7 +3445,8 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
             : links is { Count: > 1 } ? $", O open a link ({links.Count})"
             : "";
         var extraHint = actions is { Length: > 0 } ? ", " + string.Join(", ", actions.Select(a => a.Hint)) : "";
-        AnsiConsole.Markup($"[grey]{position} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}, ←/Esc/Backspace/Q back[/]");
+        var olderHint = loadMoreAtTop && offset == 0 ? " (↑ loads older)" : "";
+        AnsiConsole.Markup($"[grey]{position}{olderHint} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}, ←/Esc/Backspace/Q back[/]");
 
         if (autoRefresh is { } interval)
         {
@@ -3466,6 +3472,9 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
         }
         switch (key.Key)
         {
+            case ConsoleKey.UpArrow or ConsoleKey.K or ConsoleKey.PageUp when offset == 0 && loadMoreAtTop:
+                AnsiConsole.Clear();
+                return ConsoleKey.F6;
             case ConsoleKey.UpArrow or ConsoleKey.K: offset--; break;
             case ConsoleKey.DownArrow or ConsoleKey.J: offset++; break;
             case ConsoleKey.PageUp: offset -= height; break;
@@ -4510,7 +4519,8 @@ static async Task<List<SmsConversation>> ScrapeConversationsAsync(IPage page)
 // reply with R, react to a message with E, quote-reply to a message with T;
 // the thread refreshes after each action. It also refreshes itself after a
 // minute idle at the end of the thread (the page is live, so a rescrape picks
-// up new messages), and F5 refreshes on demand.
+// up new messages), F5 refreshes on demand, and scrolling up past the top
+// loads older history (the view stays on the messages that were showing).
 static async Task ShowSmsConversationAsync(IPage page, int index, string name)
 {
     await AnsiConsole.Status().StartAsync("Opening conversation...", async _ =>
@@ -4520,6 +4530,10 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
             new PageWaitForSelectorOptions { Timeout = 20000 });
         await page.WaitForTimeoutAsync(800); // let the thread finish rendering
     });
+
+    // Line count of the render shown when older history was requested; the next
+    // render reopens offset by however many lines the load added above it.
+    int? keepViewLines = null;
 
     while (true)
     {
@@ -4544,6 +4558,13 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
             Expand = true
         };
 
+        int? startLine = null;
+        if (keepViewLines is { } prevLines)
+        {
+            startLine = Math.Max(0, RenderToLines(panel).Count - prevLines);
+            keepViewLines = null;
+        }
+
         var action = ShowInPager(panel, BuildLinks([], sb.ToString()),
             actions:
             [
@@ -4551,10 +4572,21 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
                 (ConsoleKey.T, "T reply-to"), (ConsoleKey.A, "A archive"),
                 (ConsoleKey.F5, "F5 refresh")
             ], startAtEnd: true, tryReadLinksInTerminal: true,
-            autoRefresh: TimeSpan.FromMinutes(1));
+            autoRefresh: TimeSpan.FromMinutes(1), startAtLine: startLine, loadMoreAtTop: true);
         if (action == null) return;
 
         if (action == ConsoleKey.F5) continue; // idle timeout or manual — rescrape the live thread
+
+        if (action == ConsoleKey.F6) // scrolled past the top — pull older history
+        {
+            // Anchor on the current render's line count: after the rescrape the
+            // view reopens shifted down by exactly the lines added above it —
+            // and if nothing loaded, that shift is zero, i.e. still at the top.
+            keepViewLines = RenderToLines(panel).Count;
+            await AnsiConsole.Status().StartAsync("Loading older messages...",
+                async _ => await TryLoadOlderSmsAsync(page));
+            continue;
+        }
 
         if (action == ConsoleKey.E)
         {
@@ -4707,6 +4739,37 @@ static async Task<List<SmsMessage>> ScrapeThreadMessagesAsync(IPage page)
                 m.GetProperty("relative").GetString() ?? "")));
     }
     return list;
+}
+
+// Scrolls the thread's scroll container to the top so Google Messages lazy-loads
+// older history, then waits (up to ~4s) for more bubbles to appear. The container
+// is found by walking up from the first message bubble to the first scrollable
+// ancestor, so it survives class-name churn. True if the message count grew.
+static async Task<bool> TryLoadOlderSmsAsync(IPage page)
+{
+    try
+    {
+        return await page.EvaluateAsync<bool>(@"async () => {
+            const count = () => document.querySelectorAll('mws-message-wrapper').length;
+            const first = document.querySelector('mws-message-wrapper');
+            if (!first) return false;
+            let el = first.parentElement;
+            while (el && el.scrollHeight <= el.clientHeight + 1) el = el.parentElement;
+            if (!el) return false;
+            const before = count();
+            el.scrollTop = 0;
+            el.dispatchEvent(new Event('scroll'));
+            for (let i = 0; i < 40; i++) {
+                await new Promise(r => setTimeout(r, 100));
+                if (count() > before) {
+                    await new Promise(r => setTimeout(r, 400)); // let the batch finish rendering
+                    return true;
+                }
+            }
+            return false;
+        }");
+    }
+    catch (Exception ex) { AppLog.Debug("sms load older", ex); return false; }
 }
 
 // Pulls display-ready time text out of a bubble's accessibility label, e.g.
