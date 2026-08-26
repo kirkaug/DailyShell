@@ -48,8 +48,9 @@ record SmsConversation(int Index, string Name, string Snippet, bool Unread);
 
 // One message bubble in an open Google Messages thread. Index is the message's
 // position among the thread's mws-message-wrapper elements, used to target
-// per-message hover actions (react, reply).
-record SmsMessage(int Index, bool Incoming, string Text);
+// per-message hover actions (react, reply). Timestamp is best-effort display
+// text ("August 26, 2026 at 12:15 PM" or a relative "5 min"); "" when unknown.
+record SmsMessage(int Index, bool Incoming, string Text, string Timestamp = "");
 
 // Discord: everything one gateway READY snapshot gives the UI. ReadStates maps
 // channel id -> (last message id the user has acked, unread mention count) and

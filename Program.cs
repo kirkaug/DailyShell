@@ -4528,9 +4528,10 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
         var sb = new StringBuilder();
         foreach (var m in messages)
         {
+            var stamp = m.Timestamp.Length > 0 ? $"  [dim]{Markup.Escape(m.Timestamp)}[/]" : "";
             sb.Append(m.Incoming
-                ? $"[bold cyan]{Markup.Escape(name)}[/]\n"
-                : "[bold green]You[/]\n");
+                ? $"[bold cyan]{Markup.Escape(name)}[/]{stamp}\n"
+                : $"[bold green]You[/]{stamp}\n");
             sb.Append(Markup.Escape(m.Text)).Append("\n\n");
         }
         if (sb.Length == 0)
@@ -4673,12 +4674,23 @@ static async Task<bool> TrySendReplyAsync(IPage page, string text)
 // 'incoming' is a trap.
 static async Task<List<SmsMessage>> ScrapeThreadMessagesAsync(IPage page)
 {
+    // Per-message times aren't in the visible text — Google Messages puts them in
+    // accessibility labels ('... Received on August 26, 2026 at 12:15 PM.') and
+    // renders a relative stamp element on some bubbles. Collect both raw and let
+    // ExtractSmsTimestamp pick; an unrecognized layout just means no timestamp.
     var json = await page.EvaluateAsync<string>(
-        @"() => JSON.stringify(Array.from(document.querySelectorAll('mws-message-wrapper')).map((e, i) => ({
-            index: i,
-            incoming: !(e.getAttribute('is-outgoing') === 'true' || e.classList.contains('outgoing')),
-            text: (e.innerText || '').split('\n').map(s => s.trim()).filter(s => s.length > 0).join('\n')
-        })))");
+        @"() => JSON.stringify(Array.from(document.querySelectorAll('mws-message-wrapper')).map((e, i) => {
+            const labels = [e.getAttribute('aria-label') || '',
+                ...Array.from(e.querySelectorAll('[aria-label]')).map(x => x.getAttribute('aria-label') || '')];
+            const rel = e.querySelector('mws-relative-timestamp');
+            return {
+                index: i,
+                incoming: !(e.getAttribute('is-outgoing') === 'true' || e.classList.contains('outgoing')),
+                text: (e.innerText || '').split('\n').map(s => s.trim()).filter(s => s.length > 0).join('\n'),
+                stampLabel: labels.find(l => /\d{1,2}:\d{2}\s*[AP]M/i.test(l)) || '',
+                relative: rel ? (rel.innerText || '').trim() : ''
+            };
+        }))");
 
     var list = new List<SmsMessage>();
     using var doc = JsonDocument.Parse(json);
@@ -4689,9 +4701,32 @@ static async Task<List<SmsMessage>> ScrapeThreadMessagesAsync(IPage page)
         list.Add(new SmsMessage(
             m.GetProperty("index").GetInt32(),
             m.GetProperty("incoming").GetBoolean(),
-            text));
+            text,
+            ExtractSmsTimestamp(
+                m.GetProperty("stampLabel").GetString() ?? "",
+                m.GetProperty("relative").GetString() ?? "")));
     }
     return list;
+}
+
+// Pulls display-ready time text out of a bubble's accessibility label, e.g.
+// "Hi. Received on August 26, 2026 at 12:15 PM." -> "August 26, 2026 at 12:15 PM".
+// The last 'Sent/Received on ...' clause wins (message text could contain one);
+// a label with just a bare time falls back to that, then to the visible
+// relative stamp ("5 min"), then to "".
+static string ExtractSmsTimestamp(string ariaLabel, string relative)
+{
+    var clauses = Regex.Matches(ariaLabel,
+        @"\b(?:Sent|Received)\b[^.]*?\bon\b\s+([^.]+?)\s*\.?\s*(?=$|[.])", RegexOptions.IgnoreCase);
+    if (clauses.Count > 0) return clauses[^1].Groups[1].Value.Trim();
+
+    var bareTime = Regex.Match(ariaLabel,
+        @"(?:(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day,?\s*)?" +
+        @"(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s*)?" +
+        @"(?:\d{4},?\s*)?\d{1,2}:\d{2}\s*[AP]M", RegexOptions.IgnoreCase);
+    if (bareTime.Success) return bareTime.Value.Trim();
+
+    return relative;
 }
 
 // Menu over the most recent messages so the user can pick one to act on.
