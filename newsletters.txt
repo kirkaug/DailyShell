@@ -1,0 +1,6 @@
+# Email newsletters shown in the source menu, read from Gmail over IMAP.
+# One per line:  Label | text the From address must contain | text the Subject must contain (optional)
+# Lines starting with # are ignored. If this file exists it replaces the built-in defaults.
+
+NYT: The Morning (from your Gmail) | nytdirect@nytimes.com | The Morning
+STLPR: The Gateway (from your Gmail) | news@stlpr.org |
