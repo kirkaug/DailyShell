@@ -915,6 +915,50 @@ static bool DisplayOn(string key) =>
 static int DisplayNumber(string key, int fallback, int min, int max) =>
     int.TryParse(GetDisplaySetting(key, ""), out var n) ? Math.Clamp(n, min, max) : fallback;
 
+// Parses the agenda-hide-times display setting: comma-separated times or ranges,
+// e.g. "8:00 AM, 12 PM - 1 PM". Each becomes a [start, end) time-of-day window;
+// a single time is a one-minute window. Unparseable entries are ignored.
+static List<(TimeSpan Start, TimeSpan End)> LoadAgendaHiddenTimes()
+{
+    var windows = new List<(TimeSpan, TimeSpan)>();
+    foreach (var entry in GetDisplaySetting("agenda-hide-times", "")
+                 .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+    {
+        var parts = entry.Split('-', 2, StringSplitOptions.TrimEntries);
+        if (!TryParseTimeOfDay(parts[0], out var start)) continue;
+        if (parts.Length == 2 && TryParseTimeOfDay(parts[1], out var end))
+            windows.Add((start, end));
+        else
+            windows.Add((start, start + TimeSpan.FromMinutes(1)));
+    }
+    return windows;
+}
+
+static bool TryParseTimeOfDay(string text, out TimeSpan time)
+{
+    string[] formats = ["h:mm tt", "h:mmtt", "h tt", "htt", "H:mm", "HH:mm"];
+    if (DateTime.TryParseExact(text.Trim(), formats, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var dt))
+    {
+        time = dt.TimeOfDay;
+        return true;
+    }
+    time = default;
+    return false;
+}
+
+// True when an event's start falls inside a hidden window. All-day events are
+// never hidden (their midnight "start" isn't a real time). A window whose end
+// precedes its start wraps overnight (10 PM - 6 AM).
+static bool IsAgendaHidden(DateTime start, bool allDay, List<(TimeSpan Start, TimeSpan End)> windows)
+{
+    if (allDay || windows.Count == 0) return false;
+    var t = start.TimeOfDay;
+    foreach (var (s, e) in windows)
+        if (s <= e ? t >= s && t < e : t >= s || t < e) return true;
+    return false;
+}
+
 // Builds the multi-line main-menu header: current conditions with today's
 // high/low, then the next few timed (non-all-day) calendar events. Both parts
 // can be toggled off in Settings > Main menu display.
@@ -958,6 +1002,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
     var now = DateTime.Now;
     var events = new List<(DateTime Start, string Title)>();
     var seen = new HashSet<(DateTime, string)>();
+    var hiddenTimes = LoadAgendaHiddenTimes();
 
     // Fetch all feeds in parallel — a throttled feed answers slowly, and paying
     // that cost once beats paying it per feed.
@@ -979,6 +1024,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
                 var start = occurrence.Period.StartTime.AsSystemLocal;
                 var end = occurrence.Period.EndTime?.AsSystemLocal ?? start;
                 if (end < now) continue; // already over
+                if (IsAgendaHidden(start, allDay: false, hiddenTimes)) continue;
 
                 var title = ev.Summary ?? "(untitled)";
                 if (seen.Add((start, title.Trim().ToLowerInvariant())))
@@ -3804,8 +3850,11 @@ static async Task ShowCalendarAgendaAsync()
         });
 
         // The same event often lives on several calendars — show it once, with all
-        // of its calendar names joined in the tag.
+        // of its calendar names joined in the tag. Events starting inside an
+        // agenda-hide-times window are dropped entirely.
+        var hiddenTimes = LoadAgendaHiddenTimes();
         var events = raw
+            .Where(e => !IsAgendaHidden(e.Start, e.AllDay, hiddenTimes))
             .GroupBy(e => (e.Start, e.End, e.AllDay, Title: e.Title.Trim().ToLowerInvariant()))
             .Select(g => (
                 g.Key.Start,

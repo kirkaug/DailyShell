@@ -73,7 +73,7 @@ integrations you want.
 | `[reddit-oauth]` | Reddit scores/comments | Client id + secret from a free 'script' app at reddit.com/prefs/apps |
 | `[nyt-cookies]` | Full NYT article text | Your nytimes.com Cookie header (or use the in-app "Connect NYT account") |
 | `[discord]` | Discord section | Your Discord user token (instructions in Settings) |
-| `[display]` | Menu header tweaks | `weather`, `agenda`, `agenda-items`, `agenda-days` toggles |
+| `[display]` | Menu header tweaks | `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`) |
 
 Files the app generates (caches, game progress, logs, browser profiles) are
 kept in a `data/` subfolder.
