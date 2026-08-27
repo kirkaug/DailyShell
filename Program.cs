@@ -1284,6 +1284,7 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
     var score = found.Sum(BeeScore);
     var outer = puzzle.OuterLetters.Select(s => s.ToUpperInvariant()).ToList();
     var showHintsPanel = false;
+    IRenderable? extraHints = null; // fetched on first ":extrahints", then reused
     var message = "[grey]Type a word and press Enter. Blank line shuffles. \":hint\" popup, \":hints\" side-by-side, \":q\" to quit.[/]";
 
     // Live sync: a background pump pushes the latest snapshot to NYT as words are
@@ -1382,6 +1383,19 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
         if (word is ":hint" or ":h" or "?")
         {
             ShowInPager(BuildBeeHints(puzzle, found));
+            continue;
+        }
+        if (word is ":extrahints" or ":eh")                // hidden: forum-comment clues
+        {
+            extraHints ??= await AnsiConsole.Status().StartAsync("Fetching community hints...",
+                async _ => await FetchBeeForumHintsAsync(puzzle.PrintDate));
+            if (extraHints == null)
+                message = "[yellow]Couldn't find a crossword-style hints comment on today's Spelling Bee Forum.[/]";
+            else
+            {
+                ShowInPager(extraHints);
+                message = "[grey]\":extrahints\" shows them again (cached).[/]";
+            }
             continue;
         }
         if (word.Length == 0)                              // shuffle
@@ -1512,6 +1526,77 @@ static IRenderable BuildBeeHints(SpellingBeePuzzle puzzle, HashSet<string> found
         Padding = new Padding(1, 1, 1, 1),
         Expand = expand
     };
+}
+
+// Hidden ":extrahints" extra: each day's Spelling Bee Forum article (NYT's official
+// hints page) has a comment section where a reader posts crossword-style clues for
+// every answer — numbered by word length under two-letter-prefix headers. This pulls
+// the forum's comments from NYT's community API (sort=oldest; the clue-writers post
+// early, so the first pages have it) and picks the comment that looks like that list:
+// at least 5 lines shaped like "7) clue text", most-recommended wins. The author's
+// own replies come along too, since the list often continues "in Replies".
+static async Task<IRenderable?> FetchBeeForumHintsAsync(string printDate)
+{
+    try
+    {
+        if (!Regex.IsMatch(printDate, @"^\d{4}-\d{2}-\d{2}$")) return null;
+        var article = $"https://www.nytimes.com/{printDate.Replace('-', '/')}/crosswords/spelling-bee-forum.html";
+        var api = "https://www.nytimes.com/svc/community/V3/requestHandler?url=" +
+                  Uri.EscapeDataString(article) + "&method=get&cmd=GetCommentsAll&sort=oldest";
+
+        var clueLine = new Regex(@"^\s*\d+\s*\)", RegexOptions.Multiline);
+        (int Recs, string Author, string Body, List<string> Replies)? best = null;
+
+        var total = int.MaxValue;
+        for (var offset = 0; offset < Math.Min(total, 100); offset += 25)
+        {
+            using var doc = JsonDocument.Parse(await Web.GetStringAsync($"{api}&offset={offset}"));
+            var results = doc.RootElement.GetProperty("results");
+            if (results.TryGetProperty("totalCommentsFound", out var t) && t.TryGetInt32(out var n))
+                total = n;
+
+            var comments = results.GetProperty("comments");
+            if (comments.GetArrayLength() == 0) break;
+            foreach (var c in comments.EnumerateArray())
+            {
+                var body = StripHtml(c.GetProperty("commentBody").GetString());
+                if (clueLine.Matches(body).Count < 5) continue;
+
+                var recs = c.TryGetProperty("recommendations", out var r) ? r.GetInt32() : 0;
+                if (best != null && recs <= best.Value.Recs) continue;
+
+                var author = c.GetProperty("userDisplayName").GetString() ?? "?";
+                var replies = new List<string>();
+                if (c.TryGetProperty("replies", out var reps) && reps.ValueKind == JsonValueKind.Array)
+                    foreach (var rep in reps.EnumerateArray())
+                        if (rep.TryGetProperty("userDisplayName", out var ra) && ra.GetString() == author)
+                            replies.Add(StripHtml(rep.GetProperty("commentBody").GetString()));
+                best = (recs, author, body, replies);
+            }
+        }
+        if (best == null) return null;
+
+        var (bestRecs, bestAuthor, bestBody, bestReplies) = best.Value;
+        var sb = new StringBuilder();
+        sb.Append($"[bold]Extra hints — {Markup.Escape(printDate)}[/]\n");
+        sb.Append($"[dim]From the Spelling Bee Forum comments, by [/][bold]{Markup.Escape(bestAuthor)}[/]" +
+                  $"[dim] ({bestRecs} recommendations)[/]\n\n");
+        sb.Append(Markup.Escape(bestBody));
+        foreach (var reply in bestReplies)
+            sb.Append($"\n\n[dim]— reply from {Markup.Escape(bestAuthor)} —[/]\n").Append(Markup.Escape(reply));
+
+        return new Panel(new Markup(sb.ToString()))
+        {
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 1, 1, 1),
+            Expand = true
+        };
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("bee extra hints", ex);
+        return null;
+    }
 }
 
 // Local progress: found words for a given puzzle date, in spellingbee-progress.json.
