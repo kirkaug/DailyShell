@@ -947,6 +947,15 @@ static bool TryParseTimeOfDay(string text, out TimeSpan time)
     return false;
 }
 
+// Titles to hide, from the agenda-hide-events display setting: comma-separated,
+// matched as case-insensitive substrings of the event title.
+static string[] LoadAgendaHiddenEvents() =>
+    GetDisplaySetting("agenda-hide-events", "")
+        .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+static bool IsAgendaHiddenTitle(string title, string[] hidden) =>
+    hidden.Any(h => title.Contains(h, StringComparison.OrdinalIgnoreCase));
+
 // True when an event's start falls inside a hidden window. All-day events are
 // never hidden (their midnight "start" isn't a real time). A window whose end
 // precedes its start wraps overnight (10 PM - 6 AM).
@@ -1003,6 +1012,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
     var events = new List<(DateTime Start, string Title)>();
     var seen = new HashSet<(DateTime, string)>();
     var hiddenTimes = LoadAgendaHiddenTimes();
+    var hiddenEvents = LoadAgendaHiddenEvents();
 
     // Fetch all feeds in parallel — a throttled feed answers slowly, and paying
     // that cost once beats paying it per feed.
@@ -1027,6 +1037,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
                 if (IsAgendaHidden(start, allDay: false, hiddenTimes)) continue;
 
                 var title = ev.Summary ?? "(untitled)";
+                if (IsAgendaHiddenTitle(title, hiddenEvents)) continue;
                 if (seen.Add((start, title.Trim().ToLowerInvariant())))
                     events.Add((start, title));
             }
@@ -3851,10 +3862,13 @@ static async Task ShowCalendarAgendaAsync()
 
         // The same event often lives on several calendars — show it once, with all
         // of its calendar names joined in the tag. Events starting inside an
-        // agenda-hide-times window are dropped entirely.
+        // agenda-hide-times window, or whose title matches agenda-hide-events,
+        // are dropped entirely.
         var hiddenTimes = LoadAgendaHiddenTimes();
+        var hiddenEvents = LoadAgendaHiddenEvents();
         var events = raw
-            .Where(e => !IsAgendaHidden(e.Start, e.AllDay, hiddenTimes))
+            .Where(e => !IsAgendaHidden(e.Start, e.AllDay, hiddenTimes) &&
+                        !IsAgendaHiddenTitle(e.Title, hiddenEvents))
             .GroupBy(e => (e.Start, e.End, e.AllDay, Title: e.Title.Trim().ToLowerInvariant()))
             .Select(g => (
                 g.Key.Start,
