@@ -30,29 +30,10 @@ try
 }
 catch { /* redirected/unsupported console — leave the default */ }
 
-// Preloaded sources shown in the selection menu. Display name -> feed URL.
-// Note: NYT's "The Morning" email newsletter has no public RSS feed;
-// "NYT Daily Top Stories" is the official feed behind the daily headlines.
-var preloadedSources = new List<(string Name, string Url)>
-{
-    ("NYT Daily Top Stories", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
-    ("NYT U.S. News", "https://rss.nytimes.com/services/xml/rss/nyt/US.xml"),
-    ("BBC", "http://feeds.bbci.co.uk/news/rss.xml"),
-    ("NPR", "https://feeds.npr.org/1001/rss.xml"),
-    ("AP", "https://feedx.net/rss/ap.xml"),
-    ("Webster-Kirkwood Times", "https://www.timesnewspapers.com/search/?f=rss&t=article&c=webster-kirkwoodtimes&l=50&s=start_time&sd=desc"),
-};
-
-// Name-based lookup so typing "nyt", "bbc", etc. still works with custom input.
-var sourceLookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-{
-    { "nyt", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml" },
-    { "new york times", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml" },
-    { "bbc", "http://feeds.bbci.co.uk/news/rss.xml" },
-    { "npr", "https://feeds.npr.org/1001/rss.xml" },
-    { "webster-kirkwood times", "https://www.timesnewspapers.com/search/?f=rss&t=article&c=webster-kirkwoodtimes&l=50&s=start_time&sd=desc" },
-	{ "ap", "https://feedx.net/rss/ap.xml"}
-};
+// Preloaded sources shown in the selection menu. Editable in Settings
+// ([news-sources]); the lookup adds short typed aliases ("nyt", "bbc", ...).
+var preloadedSources = LoadNewsSources();
+var sourceLookup = BuildSourceLookup(preloadedSources);
 
 // Email newsletters read straight from Gmail (full text). Editable in Settings ([newsletters]).
 var emailNewsletters = LoadEmailNewsletters();
@@ -63,6 +44,7 @@ const string calendarOption = "Calendar agenda";
 const string unreadOption = "Email inbox";
 const string smsOption = "Text messages";
 const string discordOption = "Discord";
+const string geminiOption = "Gemini";
 const string gamesOption = "Games";
 const string settingsOption = "Settings";
 const string exitOption = "Exit";
@@ -83,15 +65,29 @@ while (true)
         headerFetchedAt = DateTime.Now;
     }
 
-    string? headerText = null;
-    if (await Task.WhenAny(menuHeaderTask, Task.Delay(2500)) == menuHeaderTask)
-        headerText = await menuHeaderTask;
-    if (headerText != null)
-        AnsiConsole.MarkupLine(headerText + "\n");
+    var headerLines = new List<string>();
+    if (DisplayOn("clock"))
+        headerLines.Add($"[bold]{DateTime.Now:h:mm tt}[/] [dim]•[/] {DateTime.Now:dddd, MMMM d, yyyy}");
 
-    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, gamesOption, settingsOption, exitOption };
+    if (await Task.WhenAny(menuHeaderTask, Task.Delay(2500)) == menuHeaderTask
+        && await menuHeaderTask is { } headerText)
+        headerLines.Add(headerText);
+    if (headerLines.Count > 0)
+        AnsiConsole.MarkupLine(string.Join("\n", headerLines) + "\n");
 
-    var mainIdx = PromptMenu("[green]Pick an option:[/]", mainOptions, 15, backAction: "exit", initialSelected: lastSourceIdx);
+    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, geminiOption, gamesOption, settingsOption, exitOption };
+
+    // While the header fetch is still running, refreshWhen redraws the menu the
+    // moment it lands (so a slow first fetch doesn't leave the header blank until
+    // the next visit); with the clock on, a 60s auto-refresh keeps the time honest.
+    var mainIdx = PromptMenu("[green]Pick an option:[/]", mainOptions, 15, backAction: "exit", initialSelected: lastSourceIdx,
+        autoRefresh: DisplayOn("clock") ? TimeSpan.FromSeconds(60) : null,
+        refreshWhen: menuHeaderTask.IsCompleted ? null : () => menuHeaderTask.IsCompleted);
+    if (mainIdx <= -2)
+    {
+        lastSourceIdx = -2 - mainIdx; // keep the highlight through the redraw
+        continue;
+    }
     if (mainIdx < 0) break;
     lastSourceIdx = mainIdx;
     var choice = mainOptions[mainIdx];
@@ -134,6 +130,12 @@ while (true)
         continue;
     }
 
+    if (choice == geminiOption)
+    {
+        await ShowGeminiAsync();
+        continue;
+    }
+
     if (choice == gamesOption)
     {
         await ShowGamesMenuAsync();
@@ -144,9 +146,11 @@ while (true)
     {
         ShowSettings();
 
-        // Newsletters or display settings may have been edited; reload so the
-        // news menu and the header reflect them right away.
+        // Newsletters, news sources, or display settings may have been edited;
+        // reload so the news menu and the header reflect them right away.
         emailNewsletters = LoadEmailNewsletters();
+        preloadedSources = LoadNewsSources();
+        sourceLookup = BuildSourceLookup(preloadedSources);
         menuHeaderTask = FetchMenuHeaderAsync();
         headerFetchedAt = DateTime.Now;
         continue;
@@ -166,6 +170,9 @@ static async Task ShowGamesMenuAsync()
     const string mini = "The Mini (crossword)";
     const string midi = "The Midi (crossword)";
     const string daily = "Daily crossword (full-size)";
+    const string mazeCraze = "Maze Craze";
+    const string snakeGame = "Snake";
+    const string breakoutGame = "Breakout";
     const string archive = "Archive — play a previous day...";
     const string stats = "Stats — your NYT account";
     const string back = "<= Back to Main Menu";
@@ -176,7 +183,12 @@ static async Task ShowGamesMenuAsync()
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold blue]Games[/]");
 
-        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, archive, stats, back };
+        // Connect lives here because the NYT account mainly powers game sync/stats.
+        var nytConnectOption = NytBrowser.IsConnected
+            ? "Reconnect NYT account (game sync & stats)"
+            : "Connect NYT account (game sync & stats)";
+
+        var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, mazeCraze, snakeGame, breakoutGame, archive, stats, nytConnectOption, back };
         var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
@@ -199,10 +211,499 @@ static async Task ShowGamesMenuAsync()
             await PlayCrosswordAsync("midi", "The Midi");
         else if (options[idx] == daily)
             await PlayCrosswordAsync("daily", "Daily Crossword");
+        else if (options[idx] == mazeCraze)
+            await PlayMazeCrazeAsync();
+        else if (options[idx] == snakeGame)
+            await PlaySnakeAsync();
+        else if (options[idx] == breakoutGame)
+            await PlayBreakoutAsync();
         else if (options[idx] == archive)
             await ShowGamesArchiveMenuAsync();
         else if (options[idx] == stats)
             await ShowGamesStatsAsync();
+        else if (options[idx] == nytConnectOption)
+            await NytBrowser.ConnectAsync();
+    }
+}
+
+// Maze Craze — a randomly generated maze sized to fill the terminal window.
+// Walk from the top-left start to the green exit at bottom-right with the arrow
+// keys (or WASD). Purely local: no NYT account, nothing saved to disk.
+static Task PlayMazeCrazeAsync()
+{
+    var rng = new Random();
+    Console.CursorVisible = false;
+    try
+    {
+        while (PlayOneMaze(rng)) { }
+    }
+    finally
+    {
+        Console.CursorVisible = true;
+        AnsiConsole.Clear();
+    }
+    return Task.CompletedTask;
+}
+
+// One maze, generated for the window size at the moment it starts (resize and
+// press N for a maze that fits the new size). Returns true to play another.
+static bool PlayOneMaze(Random rng)
+{
+    var winW = Math.Max(20, Console.WindowWidth);
+    var winH = Math.Max(10, Console.WindowHeight);
+
+    // The maze renders as a wall grid of (2w+1) x (2h+1) squares, each square two
+    // characters wide, plus a title row above and a status row below.
+    var w = Math.Max(2, (winW / 2 - 1) / 2);
+    var h = Math.Max(2, (winH - 3) / 2);
+    var wall = BuildMaze(w, h, rng);
+    var gh = 2 * h + 1;
+
+    // A wall-grid square is two characters at (2*gx, gy+1); a cell sits at the
+    // odd grid coordinates (2x+1, 2y+1).
+    static void DrawSquare(int gx, int gy, string markup)
+    {
+        Console.SetCursorPosition(2 * gx, gy + 1);
+        AnsiConsole.Markup(markup);
+    }
+    static void DrawCell(int x, int y, string markup) => DrawSquare(2 * x + 1, 2 * y + 1, markup);
+
+    void Status(string markup)
+    {
+        Console.SetCursorPosition(0, gh + 1);
+        Console.Write(new string(' ', winW - 1));
+        Console.SetCursorPosition(0, gh + 1);
+        AnsiConsole.Markup(markup);
+    }
+
+    AnsiConsole.Clear();
+    Console.SetCursorPosition(0, 0);
+    AnsiConsole.Markup($"[bold blue]Maze Craze[/] [dim]{w}x{h} — reach the[/] [green]green exit[/][dim]. Arrows/WASD move, N new maze, Esc back.[/]");
+    var sb = new StringBuilder();
+    for (var gy = 0; gy < gh; gy++)
+    {
+        Console.SetCursorPosition(0, gy + 1);
+        sb.Clear();
+        for (var gx = 0; gx < 2 * w + 1; gx++)
+            sb.Append(wall[gy, gx] ? "[grey35]██[/]" : "  ");
+        AnsiConsole.Markup(sb.ToString());
+    }
+    DrawCell(w - 1, h - 1, "[bold green]▒▒[/]");
+    DrawCell(0, 0, "[bold yellow]██[/]");
+
+    var px = 0;
+    var py = 0;
+    var steps = 0;
+    var sw = new Stopwatch();
+    Status("[dim]Steps[/] 0");
+
+    while (true)
+    {
+        var key = Console.ReadKey(intercept: true);
+        if (key.Key == ConsoleKey.Escape) return false;
+        if (key.Key == ConsoleKey.N) return true;
+
+        var (dx, dy) = key.Key switch
+        {
+            ConsoleKey.UpArrow or ConsoleKey.W => (0, -1),
+            ConsoleKey.DownArrow or ConsoleKey.S => (0, 1),
+            ConsoleKey.LeftArrow or ConsoleKey.A => (-1, 0),
+            ConsoleKey.RightArrow or ConsoleKey.D => (1, 0),
+            _ => (0, 0),
+        };
+        if ((dx, dy) == (0, 0)) continue;
+        if (wall[2 * py + 1 + dy, 2 * px + 1 + dx]) continue;   // border squares are always walls
+
+        // Leave a breadcrumb trail behind (the cell left plus the passage square).
+        sw.Start();
+        DrawCell(px, py, "[grey30]··[/]");
+        DrawSquare(2 * px + 1 + dx, 2 * py + 1 + dy, "[grey30]··[/]");
+        px += dx;
+        py += dy;
+        steps++;
+        DrawCell(px, py, "[bold yellow]██[/]");
+
+        if (px == w - 1 && py == h - 1)
+        {
+            sw.Stop();
+            Status($"[bold green]Solved![/] {steps} steps in [bold]{sw.Elapsed:m\\:ss}[/] — [bold]N[/] for a new maze, any other key to go back.");
+            return Console.ReadKey(intercept: true).Key == ConsoleKey.N;
+        }
+        Status($"[dim]Steps[/] {steps}   [dim]Time[/] {sw.Elapsed:m\\:ss}");
+    }
+}
+
+// Carves a w x h maze with an iterative recursive-backtracker (long winding
+// corridors, Maze Craze style). Returns the wall grid: (2h+1) x (2w+1) squares,
+// true = wall; cells live at odd coordinates and every cell is reachable.
+static bool[,] BuildMaze(int w, int h, Random rng)
+{
+    var wall = new bool[2 * h + 1, 2 * w + 1];
+    for (var gy = 0; gy < 2 * h + 1; gy++)
+        for (var gx = 0; gx < 2 * w + 1; gx++)
+            wall[gy, gx] = true;
+
+    var visited = new bool[h, w];
+    var stack = new Stack<(int X, int Y)>();
+    visited[0, 0] = true;
+    wall[1, 1] = false;
+    stack.Push((0, 0));
+    Span<(int Dx, int Dy)> dirs = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+
+    while (stack.Count > 0)
+    {
+        var (x, y) = stack.Peek();
+
+        // Fisher-Yates over the four directions, then take the first unvisited.
+        for (var i = 3; i > 0; i--)
+        {
+            var j = rng.Next(i + 1);
+            (dirs[i], dirs[j]) = (dirs[j], dirs[i]);
+        }
+        var moved = false;
+        foreach (var (dx, dy) in dirs)
+        {
+            var nx = x + dx;
+            var ny = y + dy;
+            if (nx < 0 || nx >= w || ny < 0 || ny >= h || visited[ny, nx]) continue;
+            visited[ny, nx] = true;
+            wall[2 * y + 1 + dy, 2 * x + 1 + dx] = false;   // knock down the wall between
+            wall[2 * ny + 1, 2 * nx + 1] = false;
+            stack.Push((nx, ny));
+            moved = true;
+            break;
+        }
+        if (!moved) stack.Pop();
+    }
+    return wall;
+}
+
+// Snake — eat food, grow, don't hit the walls or yourself. The board fills the
+// terminal window and the game speeds up a little with every bite. Purely local.
+static Task PlaySnakeAsync()
+{
+    var rng = new Random();
+    Console.CursorVisible = false;
+    try
+    {
+        while (PlayOneSnake(rng)) { }
+    }
+    finally
+    {
+        Console.CursorVisible = true;
+        AnsiConsole.Clear();
+    }
+    return Task.CompletedTask;
+}
+
+// One game of Snake, sized to the window at start. Returns true to play another.
+static bool PlayOneSnake(Random rng)
+{
+    var winW = Math.Max(30, Console.WindowWidth);
+    var winH = Math.Max(12, Console.WindowHeight);
+
+    // Board of 2-char-wide cells: the border ring is wall, the interior playfield.
+    var gw = winW / 2;
+    var gh = winH - 2;   // title row above, status row below
+
+    static void DrawCell(int x, int y, string markup)
+    {
+        Console.SetCursorPosition(2 * x, y + 1);
+        AnsiConsole.Markup(markup);
+    }
+
+    void Status(string markup)
+    {
+        Console.SetCursorPosition(0, gh + 1);
+        Console.Write(new string(' ', winW - 1));
+        Console.SetCursorPosition(0, gh + 1);
+        AnsiConsole.Markup(markup);
+    }
+
+    AnsiConsole.Clear();
+    Console.SetCursorPosition(0, 0);
+    AnsiConsole.Markup("[bold blue]Snake[/] [dim]— arrows/WASD steer, N new game, Esc back.[/]");
+    var sb = new StringBuilder();
+    for (var y = 0; y < gh; y++)
+    {
+        Console.SetCursorPosition(0, y + 1);
+        sb.Clear();
+        for (var x = 0; x < gw; x++)
+            sb.Append(x == 0 || x == gw - 1 || y == 0 || y == gh - 1 ? "[grey35]██[/]" : "  ");
+        AnsiConsole.Markup(sb.ToString());
+    }
+
+    var snake = new LinkedList<(int X, int Y)>();
+    var body = new HashSet<(int X, int Y)>();
+    var start = (X: gw / 2, Y: gh / 2);
+    snake.AddFirst(start);
+    body.Add(start);
+    DrawCell(start.X, start.Y, "[bold green]██[/]");
+
+    (int X, int Y) PlaceFood()
+    {
+        while (true)
+        {
+            var f = (X: rng.Next(1, gw - 1), Y: rng.Next(1, gh - 1));
+            if (!body.Contains(f)) { DrawCell(f.X, f.Y, "[bold red]◆ [/]"); return f; }
+        }
+    }
+
+    var (dx, dy) = (1, 0);
+    var score = 0;
+    var delay = 110;
+    var food = PlaceFood();
+    Status("[dim]Score[/] 0");
+
+    while (true)
+    {
+        // Drain buffered keys; the last direction pressed wins, but the snake
+        // can't reverse straight into its own neck.
+        while (Console.KeyAvailable)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Escape) return false;
+            if (key.Key == ConsoleKey.N) return true;
+            var (nx, ny) = key.Key switch
+            {
+                ConsoleKey.UpArrow or ConsoleKey.W => (0, -1),
+                ConsoleKey.DownArrow or ConsoleKey.S => (0, 1),
+                ConsoleKey.LeftArrow or ConsoleKey.A => (-1, 0),
+                ConsoleKey.RightArrow or ConsoleKey.D => (1, 0),
+                _ => (dx, dy),
+            };
+            if (snake.Count == 1 || (nx, ny) != (-dx, -dy)) (dx, dy) = (nx, ny);
+        }
+
+        var head = snake.First!.Value;
+        var next = (X: head.X + dx, Y: head.Y + dy);
+        var ate = next == food;
+        if (!ate)
+        {
+            var tail = snake.Last!.Value;   // the tail vacates before the head arrives
+            snake.RemoveLast();
+            body.Remove(tail);
+            DrawCell(tail.X, tail.Y, "  ");
+        }
+
+        if (next.X <= 0 || next.X >= gw - 1 || next.Y <= 0 || next.Y >= gh - 1 || body.Contains(next))
+        {
+            Status($"[bold red]Game over![/] Score [bold]{score}[/] — [bold]N[/] for a new game, any other key to go back.");
+            return Console.ReadKey(intercept: true).Key == ConsoleKey.N;
+        }
+
+        DrawCell(head.X, head.Y, "[green]██[/]");
+        snake.AddFirst(next);
+        body.Add(next);
+        DrawCell(next.X, next.Y, "[bold green]██[/]");
+
+        if (ate)
+        {
+            score++;
+            delay = Math.Max(45, delay - 3);
+            food = PlaceFood();
+            Status($"[dim]Score[/] {score}");
+        }
+
+        // Cells are two characters wide but only one tall, so vertical travel gets
+        // a slower tick to keep the apparent speed roughly even.
+        Thread.Sleep(dy != 0 ? delay * 8 / 5 : delay);
+    }
+}
+
+// Breakout — paddle, ball, and rows of colored bricks worth more the higher they
+// sit. Three lives; clear every brick to win. Purely local.
+static Task PlayBreakoutAsync()
+{
+    var rng = new Random();
+    Console.CursorVisible = false;
+    try
+    {
+        while (PlayOneBreakout(rng)) { }
+    }
+    finally
+    {
+        Console.CursorVisible = true;
+        AnsiConsole.Clear();
+    }
+    return Task.CompletedTask;
+}
+
+// One game of Breakout, sized to the window at start. Returns true to play another.
+static bool PlayOneBreakout(Random rng)
+{
+    var winW = Math.Max(40, Console.WindowWidth);
+    var winH = Math.Max(14, Console.WindowHeight);
+
+    // Character-resolution playfield: side walls at x=0 and x=right, ceiling at
+    // row 1, paddle on the bottom interior row, status line beneath.
+    var right = winW - 2;
+    var pr = winH - 2;
+    const int brickTop = 3;
+    const int brickW = 7;
+    string[] rowColors = ["red", "darkorange", "yellow", "green", "aqua", "deepskyblue1"];
+    int[] rowPoints = [7, 7, 4, 4, 1, 1];
+    var brickRows = Math.Clamp((pr - brickTop - 6) / 2, 2, 6);
+    var ncols = (right - 1) / brickW;
+    var brickLeft = 1 + (right - 1 - ncols * brickW) / 2;
+    var brick = new bool[brickRows, ncols];
+    var remaining = brickRows * ncols;
+
+    var padW = Math.Clamp(winW / 8, 7, 16);
+    var padX = (right - padW) / 2;
+
+    void Status(string markup)
+    {
+        Console.SetCursorPosition(0, pr + 1);
+        Console.Write(new string(' ', winW - 1));
+        Console.SetCursorPosition(0, pr + 1);
+        AnsiConsole.Markup(markup);
+    }
+
+    void DrawPaddle()
+    {
+        Console.SetCursorPosition(1, pr);
+        Console.Write(new string(' ', right - 1));
+        Console.SetCursorPosition(padX, pr);
+        AnsiConsole.Markup($"[bold white]{new string('▀', padW)}[/]");
+    }
+
+    AnsiConsole.Clear();
+    Console.SetCursorPosition(0, 0);
+    AnsiConsole.Markup("[bold blue]Breakout[/] [dim]— left/right (or A/D) move the paddle, N new game, Esc back.[/]");
+    Console.SetCursorPosition(0, 1);
+    AnsiConsole.Markup($"[grey35]{new string('█', right + 1)}[/]");
+    for (var y = 2; y <= pr; y++)
+    {
+        Console.SetCursorPosition(0, y);
+        AnsiConsole.Markup("[grey35]█[/]");
+        Console.SetCursorPosition(right, y);
+        AnsiConsole.Markup("[grey35]█[/]");
+    }
+    for (var r = 0; r < brickRows; r++)
+    {
+        for (var c = 0; c < ncols; c++)
+        {
+            brick[r, c] = true;
+            Console.SetCursorPosition(brickLeft + c * brickW, brickTop + r);
+            AnsiConsole.Markup($"[{rowColors[r]}]{new string('█', brickW - 1)}[/]");
+        }
+    }
+    DrawPaddle();
+
+    // Ball position/velocity in character cells. vy is ±1 row per tick; vx runs up
+    // to ±2 columns per tick because characters are taller than they are wide.
+    int bx = 0, by = 0, vx = 0, vy = 0;
+    int drawnX = -1, drawnY = -1;
+    var score = 0;
+    var lives = 3;
+
+    void EraseBall()
+    {
+        if (drawnY < 0) return;
+        Console.SetCursorPosition(drawnX, drawnY);
+        if (drawnY == pr && drawnX >= padX && drawnX < padX + padW)
+            AnsiConsole.Markup("[bold white]▀[/]");
+        else
+            Console.Write(' ');
+        drawnY = -1;
+    }
+
+    void Launch()
+    {
+        bx = padX + padW / 2;
+        by = pr - 1;
+        vx = rng.Next(2) == 0 ? -1 : 1;
+        vy = -1;
+    }
+
+    Launch();
+    Status($"[dim]Score[/] 0   [dim]Lives[/] {lives}");
+
+    while (true)
+    {
+        while (Console.KeyAvailable)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Escape) return false;
+            if (key.Key == ConsoleKey.N) return true;
+            if (key.Key is ConsoleKey.LeftArrow or ConsoleKey.A)
+            {
+                padX = Math.Max(1, padX - 3);
+                DrawPaddle();
+            }
+            else if (key.Key is ConsoleKey.RightArrow or ConsoleKey.D)
+            {
+                padX = Math.Min(right - padW, padX + 3);
+                DrawPaddle();
+            }
+        }
+
+        var nx = bx + vx;
+        var ny = by + vy;
+
+        if (nx <= 0) { vx = -vx; nx = 1; }
+        else if (nx >= right) { vx = -vx; nx = right - 1; }
+        if (ny <= 1) { vy = 1; ny = 2; }
+
+        var brow = ny - brickTop;
+        if (brow >= 0 && brow < brickRows)
+        {
+            var bcol = (nx - brickLeft) / brickW;
+            if (bcol >= 0 && bcol < ncols && brick[brow, bcol])
+            {
+                brick[brow, bcol] = false;
+                remaining--;
+                score += rowPoints[brow];
+                Console.SetCursorPosition(brickLeft + bcol * brickW, brickTop + brow);
+                Console.Write(new string(' ', brickW));
+                vy = -vy;
+                ny = by;
+                if (remaining == 0)
+                {
+                    EraseBall();
+                    Status($"[bold green]You win![/] Score [bold]{score}[/] — [bold]N[/] for a new game, any other key to go back.");
+                    return Console.ReadKey(intercept: true).Key == ConsoleKey.N;
+                }
+                Status($"[dim]Score[/] {score}   [dim]Lives[/] {lives}");
+            }
+        }
+
+        if (ny == pr && nx >= padX && nx < padX + padW)
+        {
+            // The spot on the paddle sets the return angle: outer thirds send the
+            // ball out steep (±2 columns per row), the middle sends it shallow.
+            vy = -1;
+            ny = pr - 1;
+            var off = nx - (padX + padW / 2);
+            vx = off < 0 ? (off * 3 < -padW ? -2 : -1) : (off * 3 > padW ? 2 : 1);
+        }
+        else if (ny > pr)
+        {
+            EraseBall();
+            lives--;
+            if (lives == 0)
+            {
+                Status($"[bold red]Game over![/] Score [bold]{score}[/] — [bold]N[/] for a new game, any other key to go back.");
+                return Console.ReadKey(intercept: true).Key == ConsoleKey.N;
+            }
+            Status($"Ball lost — [bold]{lives}[/] left. [dim]Press any key to serve (Esc backs out).[/]");
+            var k = Console.ReadKey(intercept: true);
+            if (k.Key == ConsoleKey.Escape) return false;
+            if (k.Key == ConsoleKey.N) return true;
+            Launch();
+            Status($"[dim]Score[/] {score}   [dim]Lives[/] {lives}");
+            continue;
+        }
+
+        EraseBall();
+        bx = nx;
+        by = ny;
+        Console.SetCursorPosition(bx, by);
+        AnsiConsole.Markup("[bold white]●[/]");
+        drawnX = bx;
+        drawnY = by;
+        Thread.Sleep(45);
     }
 }
 
@@ -490,9 +991,6 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
     List<(string Name, string Url)> preloadedSources, Dictionary<string, string> sourceLookup)
 {
     const string customOption = "Enter a custom source, subreddit, or RSS URL...";
-    var nytConnectOption = NytBrowser.IsConnected
-        ? "Reconnect NYT account (for full articles)"
-        : "Connect NYT account (for full articles)";
     const string back = "<= Back to Main Menu";
 
     var lastIdx = 0;
@@ -505,7 +1003,6 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
         options.AddRange(emailNewsletters.Select(n => n.Label));
         options.AddRange(preloadedSources.Select(s => s.Name));
         options.Add(customOption);
-        options.Add(nytConnectOption);
         options.Add(back);
 
         var idx = PromptMenu("[green]Pick a news source:[/]", options, 15, initialSelected: lastIdx);
@@ -517,13 +1014,6 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
         lastIdx = idx;
         var choice = options[idx];
 
-        if (choice == nytConnectOption)
-        {
-            await NytBrowser.ConnectAsync();
-            nytConnectOption = "Reconnect NYT account (for full articles)";
-            continue;
-        }
-
         var newsletter = emailNewsletters.FirstOrDefault(n => n.Label == choice);
         if (newsletter != null)
         {
@@ -534,7 +1024,8 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
         string feedUrl;
         if (choice == customOption)
         {
-            var input = AnsiConsole.Ask<string>("[green]Enter a news source name, an RSS URL, or a subreddit (e.g. r/stlouis):[/]");
+            var input = AnsiConsole.Ask<string>(
+                "[green]Enter a news source name, an RSS URL, a website to scan for feeds, or a subreddit (e.g. r/stlouis):[/]");
 
             var subreddit = TryParseSubreddit(input);
             if (subreddit != null)
@@ -568,11 +1059,51 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
             }
 
             await DisplayArticlesAsync(feed);
+            if (choice == customOption)
+                OfferToSaveNewsSource(feed.Title?.Text, feedUrl, preloadedSources, sourceLookup);
         }
         catch (XmlException)
         {
-            // Not an RSS/Atom feed — treat it as a web page (e.g. a newsletter
-            // "view in browser" link) and render it directly.
+            // Not an RSS/Atom feed. For custom input, scan the page for feeds it
+            // advertises (autodiscovery tags, feed-ish links, well-known paths,
+            // Squarespace's ?format=rss) before falling back to rendering it.
+            if (choice == customOption)
+            {
+                var feeds = await AnsiConsole.Status().StartAsync(
+                    "Not a feed — scanning the page for RSS feeds...",
+                    async _ => await DiscoverFeedsAsync(feedUrl));
+                if (feeds.Count > 0)
+                {
+                    var pick = 0;
+                    if (feeds.Count > 1)
+                    {
+                        AnsiConsole.Clear();
+                        AnsiConsole.MarkupLine($"[bold blue]Feeds found[/] [grey]on {Markup.Escape(feedUrl)}[/]");
+                        var feedOptions = feeds.Select(f =>
+                            $"{Markup.Escape(f.Title)}  [grey]{Markup.Escape(f.Url)}[/]").ToList();
+                        feedOptions.Add("<= Cancel");
+                        pick = PromptMenu("[green]Pick a feed:[/]", feedOptions, 15);
+                        if (pick < 0 || pick == feedOptions.Count - 1) continue;
+                    }
+                    try
+                    {
+                        var discovered = await FetchFeedAsync(feeds[pick].Url);
+                        if (discovered != null && discovered.Items.Any())
+                        {
+                            await DisplayArticlesAsync(discovered);
+                            OfferToSaveNewsSource(feeds[pick].Title, feeds[pick].Url,
+                                preloadedSources, sourceLookup);
+                            continue;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.Debug("discovered feed fetch", ex); // fall through to the page view
+                    }
+                }
+            }
+
+            // e.g. a newsletter "view in browser" link — render the page directly.
             await ShowWebPageAsync(feedUrl);
         }
         catch (Exception ex)
@@ -583,10 +1114,42 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
     }
 }
 
+// After the user reads a custom/discovered feed, offers to keep it: appends it
+// to the [news-sources] section (persisting the whole effective list, since a
+// non-empty section replaces the built-in defaults) and updates the in-memory
+// menu list and name lookup so it shows up immediately.
+static void OfferToSaveNewsSource(string? title, string url,
+    List<(string Name, string Url)> sources, Dictionary<string, string> lookup)
+{
+    if (sources.Any(s => s.Url.Equals(url, StringComparison.OrdinalIgnoreCase)))
+        return; // already in the menu
+
+    if (!AnsiConsole.Confirm($"Add [bold]{Markup.Escape(title ?? url)}[/] to your news sources?", defaultValue: false))
+        return;
+
+    var name = AnsiConsole.Prompt(new TextPrompt<string>("[green]Menu name:[/]")
+            .DefaultValue(string.IsNullOrWhiteSpace(title) ? url : title.Trim()))
+        .Replace('|', '-').Trim();
+    if (name.Length == 0) return;
+
+    sources.Add((name, url));
+    lookup[name] = url;
+    try
+    {
+        Config.SetLines("news-sources", sources.Select(s => $"{s.Name} | {s.Url}"));
+        AnsiConsole.MarkupLine("[green]Added.[/] [grey]Edit it later under Settings > News sources.[/]\n");
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Couldn't save:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+    }
+}
+
 // Maps user text input to a URL
 static string ResolveFeedUrl(string input, Dictionary<string, string> lookup)
 {
-    if (Uri.TryCreate(input, UriKind.Absolute, out var uriResult) && 
+    if (Uri.TryCreate(input, UriKind.Absolute, out var uriResult) &&
         (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps))
     {
         return input;
@@ -597,7 +1160,85 @@ static string ResolveFeedUrl(string input, Dictionary<string, string> lookup)
         return url;
     }
 
+    // "seedsing.com" style input: treat a bare domain (optionally with a path)
+    // as https — feed discovery takes it from there.
+    if (Regex.IsMatch(input, @"^[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)+(/\S*)?$"))
+        return "https://" + input;
+
     return string.Empty;
+}
+
+// Finds RSS/Atom feeds for a web page that isn't itself a feed: standard
+// autodiscovery <link rel="alternate"> tags, anchors that look like feed links,
+// well-known feed paths on the site, and Squarespace's ?format=rss convention
+// (collections serve RSS there without ever advertising it). Every candidate is
+// fetched and must actually parse as feed XML to be returned.
+static async Task<List<(string Title, string Url)>> DiscoverFeedsAsync(string pageUrl)
+{
+    var baseUri = new Uri(pageUrl);
+    var candidates = new List<string>();
+
+    void AddCandidate(string? href)
+    {
+        if (string.IsNullOrWhiteSpace(href)) return;
+        if (Uri.TryCreate(baseUri, href, out var abs) &&
+            (abs.Scheme == Uri.UriSchemeHttp || abs.Scheme == Uri.UriSchemeHttps) &&
+            !candidates.Contains(abs.AbsoluteUri))
+            candidates.Add(abs.AbsoluteUri);
+    }
+
+    var html = "";
+    try { html = await Web.GetStringAsync(pageUrl); }
+    catch (Exception ex) { AppLog.Debug("feed discovery page fetch", ex); }
+
+    var doc = new HtmlDocument();
+    doc.LoadHtml(html);
+
+    // 1) Standard autodiscovery tags in the head.
+    foreach (var link in doc.DocumentNode.SelectNodes("//link[@rel='alternate']") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var type = link.GetAttributeValue("type", "");
+        if (type.Contains("rss") || type.Contains("atom"))
+            AddCandidate(link.GetAttributeValue("href", ""));
+    }
+
+    var anchors = (doc.DocumentNode.SelectNodes("//a[@href]") ?? Enumerable.Empty<HtmlNode>())
+        .Select(a => a.GetAttributeValue("href", "")).ToList();
+
+    // 2) Anchors that already look like feed links.
+    foreach (var href in anchors)
+        if (Regex.IsMatch(href, @"(\brss\b|\batom\b|/feed/?$|\.xml$|format=rss)", RegexOptions.IgnoreCase))
+            AddCandidate(href);
+
+    // 3) Well-known feed paths at the site root.
+    foreach (var p in new[] { "/feed", "/rss", "/feed.xml", "/rss.xml", "/atom.xml", "/index.xml", "/?feed=rss2" })
+        AddCandidate(p);
+
+    // 4) Squarespace collections answer ?format=rss — probe the site's own pages.
+    if (html.Contains("squarespace", StringComparison.OrdinalIgnoreCase))
+        foreach (var href in anchors
+                     .Where(h => h.StartsWith('/') && h.Length > 1 && !h.Contains('?') && !h.Contains('#'))
+                     .Distinct().Take(12))
+            AddCandidate(href + "?format=rss");
+
+    // Validate everything in parallel; keep each feed's own title for the picker.
+    var results = await Task.WhenAll(candidates.Take(24).Select(async url =>
+    {
+        try
+        {
+            var text = await Web.GetStringAsync(url);
+            if (!text.TrimStart().StartsWith('<') || (!text.Contains("<rss") && !text.Contains("<feed")))
+                return ((string Title, string Url)?)null;
+            var title = Regex.Match(text, @"<title[^>]*>\s*(?:<!\[CDATA\[)?([^<\]]{1,80})").Groups[1].Value.Trim();
+            return (title.Length > 0 ? title : url, url);
+        }
+        catch
+        {
+            return null; // 404s and non-feeds just drop out
+        }
+    }));
+
+    return results.Where(r => r != null).Select(r => r!.Value).ToList();
 }
 
 // Fetches and parses the RSS/Atom feed
@@ -915,6 +1556,17 @@ static bool DisplayOn(string key) =>
 static int DisplayNumber(string key, int fallback, int min, int max) =>
     int.TryParse(GetDisplaySetting(key, ""), out var n) ? Math.Clamp(n, min, max) : fallback;
 
+// How long the message views (texts, Discord, email) sit idle before they
+// auto-refresh, from the refresh-seconds display setting. Null disables the
+// timer ("off" or 0); anything else is clamped to 10s..1h.
+static TimeSpan? MessagesAutoRefresh()
+{
+    var raw = GetDisplaySetting("refresh-seconds", "");
+    if (raw.Equals("off", StringComparison.OrdinalIgnoreCase)) return null;
+    var seconds = int.TryParse(raw, out var n) ? n : 60;
+    return seconds <= 0 ? null : TimeSpan.FromSeconds(Math.Clamp(seconds, 10, 3600));
+}
+
 // Parses the agenda-hide-times display setting: comma-separated times or ranges,
 // e.g. "8:00 AM, 12 PM - 1 PM". Each becomes a [start, end) time-of-day window;
 // a single time is a one-minute window. Unparseable entries are ignored.
@@ -1009,7 +1661,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
     if (feeds.Count == 0) return [];
 
     var now = DateTime.Now;
-    var events = new List<(DateTime Start, string Title)>();
+    var events = new List<(DateTime Start, string Title, string Calendar)>();
     var seen = new HashSet<(DateTime, string)>();
     var hiddenTimes = LoadAgendaHiddenTimes();
     var hiddenEvents = LoadAgendaHiddenEvents();
@@ -1018,11 +1670,11 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
     // that cost once beats paying it per feed.
     var fetched = await Task.WhenAll(feeds.Select(async f =>
     {
-        try { return (await FetchCalendarIcsAsync(f.Url)).Ics; }
-        catch (Exception ex) { AppLog.Debug("returned null", ex); return null; } // a broken/throttled feed shouldn't take the header down
+        try { return (f.Label, Ics: (string?)(await FetchCalendarIcsAsync(f.Url)).Ics); }
+        catch (Exception ex) { AppLog.Debug("returned null", ex); return (f.Label, Ics: (string?)null); } // a broken/throttled feed shouldn't take the header down
     }));
 
-    foreach (var ics in fetched)
+    foreach (var (calendarLabel, ics) in fetched)
     {
         if (ics == null) continue;
         try
@@ -1039,7 +1691,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
                 var title = ev.Summary ?? "(untitled)";
                 if (IsAgendaHiddenTitle(title, hiddenEvents)) continue;
                 if (seen.Add((start, title.Trim().ToLowerInvariant())))
-                    events.Add((start, title));
+                    events.Add((start, title, calendarLabel));
             }
         }
         catch
@@ -1056,7 +1708,7 @@ static async Task<List<string>> FetchUpcomingEventLinesAsync()
             var day = e.Start.Date == DateTime.Today ? "Today"
                 : e.Start.Date == DateTime.Today.AddDays(1) ? "Tomorrow"
                 : e.Start.ToString("ddd MM/dd");
-            return $"[dim]{day} {e.Start:h:mm tt}[/]  {Markup.Escape(e.Title)}";
+            return $"[dim]{day} {e.Start:h:mm tt}[/]  {Markup.Escape(e.Title)} [dim]({Markup.Escape(e.Calendar)})[/]";
         })
         .ToList();
 }
@@ -3466,7 +4118,9 @@ static string ExtractReadableText(HtmlDocument doc)
 // Selection menu that supports going back: returns the chosen index, or -1 when the
 // user presses Esc, Backspace, or Q. Items may contain Spectre markup. Draws in
 // place below the current cursor so headers/messages above it stay visible.
-static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0)
+// With autoRefresh set, returns -2 - selected after that much idle time so the
+// caller can rebuild the list; MenuTimedOut decodes that signal.
+static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0, TimeSpan? autoRefresh = null, Func<bool>? refreshWhen = null)
 {
     pageSize = Math.Clamp(Math.Min(pageSize, items.Count), 1, Math.Max(1, Console.WindowHeight - 5));
     var frameHeight = pageSize + 3; // title + items + more-indicator + key hints
@@ -3513,6 +4167,23 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
         WriteLine(more.Length > 0 ? $"[grey]{more}[/]" : "");
         WriteLine($"[grey]Up/Down move • Enter/→ select • ←/Esc/Backspace/Q {backAction}[/]");
 
+        if (autoRefresh != null || refreshWhen != null)
+        {
+            // Poll instead of blocking so idle time can signal a refresh; the
+            // deadline restarts on every redraw, so any keypress re-arms it.
+            // refreshWhen fires the same sentinel as soon as its condition holds.
+            var deadline = autoRefresh is { } interval ? DateTime.UtcNow + interval : DateTime.MaxValue;
+            while (!Console.KeyAvailable)
+            {
+                if (DateTime.UtcNow >= deadline || refreshWhen?.Invoke() == true)
+                {
+                    Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
+                    return -2 - selected;
+                }
+                Thread.Sleep(100);
+            }
+        }
+
         var key = Console.ReadKey(intercept: true);
         switch (key.Key)
         {
@@ -3530,6 +4201,15 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
                 return -1;
         }
     }
+}
+
+// True when PromptMenu returned its idle auto-refresh signal (-2 - selected);
+// restores the cursor position into selected so the rebuilt menu reopens there.
+static bool MenuTimedOut(int idx, ref int selected)
+{
+    if (idx > -2) return false;
+    selected = -2 - idx;
+    return true;
 }
 
 // Shows content in a full-screen pager starting at the top. Up/Down scroll one line,
@@ -4164,7 +4844,20 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
             options.Add(refresh);
             options.Add("<= Back to Main Menu");
 
-            var idx = PromptMenu("Select a message:", options, 15, initialSelected: lastIdx);
+            var idx = PromptMenu("Select a message:", options, 15, initialSelected: lastIdx,
+                autoRefresh: MessagesAutoRefresh());
+            if (MenuTimedOut(idx, ref lastIdx))
+            {
+                // Keep the current list if the background refresh hiccups (e.g.
+                // the IMAP connection idled out); the next pass reconnects.
+                try
+                {
+                    messages = await AnsiConsole.Status().StartAsync("Refreshing...",
+                        async _ => await FetchInboxAsync());
+                }
+                catch (Exception ex) { AppLog.Debug("inbox auto-refresh", ex); }
+                continue;
+            }
             if (idx < 0 || idx == options.Count - 1) break;
             lastIdx = idx;
 
@@ -4519,7 +5212,11 @@ static async Task ShowTextMessagesAsync()
                 options.Add(refresh);
                 options.Add("<= Back to Main Menu");
 
-                var idx = PromptMenu("Select a conversation:", options, 15, initialSelected: lastIdx);
+                var idx = PromptMenu("Select a conversation:", options, 15, initialSelected: lastIdx,
+                    autoRefresh: MessagesAutoRefresh());
+                // Idle timeout: the loop re-scrapes the live list pane, which is
+                // enough to pick up new messages and unread markers.
+                if (MenuTimedOut(idx, ref lastIdx)) continue;
                 if (idx < 0 || idx == options.Count - 1) break;
 
                 if (options[idx] == refresh)
@@ -4552,13 +5249,13 @@ static async Task ShowTextMessagesAsync()
             $"[red]Browser automation error:[/] {Markup.Escape(ex.Message)}\n" +
             "[grey]If pairing broke or the page changed, delete the 'gmessages-profile' folder " +
             "next to the app and pair again.[/]\n");
-        await DumpMessagesDiagnosticsAsync(page);
+        await DumpPageDiagnosticsAsync(page, "gmessages");
         PauseForKey();
     }
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Text-message error:[/] {Markup.Escape(ex.Message)}\n");
-        await DumpMessagesDiagnosticsAsync(page);
+        await DumpPageDiagnosticsAsync(page, "gmessages");
         PauseForKey();
     }
     finally
@@ -4567,10 +5264,10 @@ static async Task ShowTextMessagesAsync()
     }
 }
 
-// Saves what the Google Messages page actually contained when something failed
-// (URL, custom element names, visible text, screenshot), so the scraping
-// selectors can be adapted when Google changes the app.
-static async Task DumpMessagesDiagnosticsAsync(IPage? page)
+// Saves what a scraped page actually contained when something failed (URL,
+// custom element names, visible text, screenshot) to data/<prefix>-debug.*,
+// so the scraping selectors can be adapted when Google changes the app.
+static async Task DumpPageDiagnosticsAsync(IPage? page, string prefix, string? extra = null)
 {
     if (page == null) return;
     try
@@ -4580,14 +5277,15 @@ static async Task DumpMessagesDiagnosticsAsync(IPage? page)
             ".map(e => e.tagName.toLowerCase()).filter(t => t.includes('-')))).slice(0, 80)");
         var text = await page.EvaluateAsync<string>(
             "() => (document.body.innerText || '').substring(0, 1000)");
-        File.WriteAllText(Paths.Data("gmessages-debug.txt"),
-            $"url: {page.Url}\n\ncustom elements on page:\n{string.Join("\n", tags)}\n\nvisible text:\n{text}\n");
+        File.WriteAllText(Paths.Data($"{prefix}-debug.txt"),
+            $"url: {page.Url}\n\ncustom elements on page:\n{string.Join("\n", tags)}\n\nvisible text:\n{text}\n" +
+            (extra != null ? $"\nselector probe:\n{extra}\n" : ""));
         await page.ScreenshotAsync(new PageScreenshotOptions
         {
-            Path = Paths.Data("gmessages-debug.png")
+            Path = Paths.Data($"{prefix}-debug.png")
         });
         AnsiConsole.MarkupLine(
-            "[grey]Saved what the page looked like to data/gmessages-debug.txt and .png " +
+            $"[grey]Saved what the page looked like to data/{prefix}-debug.txt and .png " +
             "— share those to get the selectors fixed.[/]\n");
     }
     catch
@@ -4665,9 +5363,10 @@ static async Task<List<SmsConversation>> ScrapeConversationsAsync(IPage page)
 
 // Opens one conversation, shows its messages in the pager, and lets the user
 // reply with R, react to a message with E, quote-reply to a message with T;
-// the thread refreshes after each action. It also refreshes itself after a
-// minute idle at the end of the thread (the page is live, so a rescrape picks
-// up new messages), F5 refreshes on demand, and scrolling up past the top
+// the thread refreshes after each action. It also refreshes itself after
+// sitting idle at the end of the thread (refresh-seconds in Settings > Main
+// menu display; the page is live, so a rescrape picks up new messages),
+// F5 refreshes on demand, and scrolling up past the top
 // loads older history (the view stays on the messages that were showing).
 static async Task ShowSmsConversationAsync(IPage page, int index, string name)
 {
@@ -4720,7 +5419,7 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
                 (ConsoleKey.T, "T reply-to"), (ConsoleKey.A, "A archive"),
                 (ConsoleKey.F5, "F5 refresh")
             ], startAtEnd: true, tryReadLinksInTerminal: true,
-            autoRefresh: TimeSpan.FromMinutes(1), startAtLine: startLine, loadMoreAtTop: true);
+            autoRefresh: MessagesAutoRefresh(), startAtLine: startLine, loadMoreAtTop: true);
         if (action == null) return;
 
         if (action == ConsoleKey.F5) continue; // idle timeout or manual — rescrape the live thread
@@ -5384,6 +6083,49 @@ static void EditConfigSection(Config.Section section)
     }
 }
 
+// Loads the preloaded news-source list from the [news-sources] section of
+// config.txt ("Name | RSS URL" per line); entries there replace the built-in
+// defaults. Note: NYT's "The Morning" email newsletter has no public RSS feed;
+// "NYT Daily Top Stories" is the official feed behind the daily headlines.
+static List<(string Name, string Url)> LoadNewsSources()
+{
+    var list = Config.Lines("news-sources")
+        .Select(l => l.Split('|', 2, StringSplitOptions.TrimEntries))
+        .Where(p => p.Length == 2 && p[0].Length > 0 &&
+                    p[1].StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        .Select(p => (p[0], p[1]))
+        .ToList();
+    if (list.Count > 0) return list;
+
+    return
+    [
+        ("NYT Daily Top Stories", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
+        ("NYT U.S. News", "https://rss.nytimes.com/services/xml/rss/nyt/US.xml"),
+        ("BBC", "http://feeds.bbci.co.uk/news/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1001/rss.xml"),
+        ("AP", "https://feedx.net/rss/ap.xml"),
+        ("Webster-Kirkwood Times", "https://www.timesnewspapers.com/search/?f=rss&t=article&c=webster-kirkwoodtimes&l=50&s=start_time&sd=desc"),
+    ];
+}
+
+// Name-based lookup so typing "nyt", "bbc", etc. still works with custom input.
+// Configured source names are added too (they win over the built-in aliases).
+static Dictionary<string, string> BuildSourceLookup(List<(string Name, string Url)> sources)
+{
+    var lookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        { "nyt", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml" },
+        { "new york times", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml" },
+        { "bbc", "http://feeds.bbci.co.uk/news/rss.xml" },
+        { "npr", "https://feeds.npr.org/1001/rss.xml" },
+        { "ap", "https://feedx.net/rss/ap.xml" },
+        { "webster-kirkwood times", "https://www.timesnewspapers.com/search/?f=rss&t=article&c=webster-kirkwoodtimes&l=50&s=start_time&sd=desc" },
+    };
+    foreach (var (name, url) in sources)
+        lookup[name] = url;
+    return lookup;
+}
+
 // Loads the email-newsletter list from the [newsletters] section of config.txt;
 // entries there replace the built-in defaults. One newsletter per line:
 //   Label | text the From address must contain | text the Subject must contain (optional)
@@ -5439,6 +6181,618 @@ static bool DiscordUnread(DiscordState state, DiscordChannel ch) =>
     !ch.Muted && ch.LastMessageId > 0 &&
     (!state.ReadStates.TryGetValue(ch.Id, out var rs) || rs.LastAcked < ch.LastMessageId);
 
+// Gemini section (browser route): drives gemini.google.com through the same
+// embedded-browser approach as Google Messages, signed into the user's own
+// Google account — so the list shows the real gemini.google.com history and a
+// Google AI Pro subscription's limits apply. First use opens a plain Chrome
+// window to sign in (automated browsers are rejected by Google sign-in); the
+// session then lives in a 'gemini-profile' folder next to the app.
+static async Task ShowGeminiAsync()
+{
+    var profileDir = Path.Combine(AppContext.BaseDirectory, "gemini-profile");
+    const string appUrl = "https://gemini.google.com/app";
+    // The composer. Google serves different frontends: some render a Quill
+    // contenteditable inside <rich-textarea>, others a plain textarea — cover both.
+    const string editorSelector = "rich-textarea div.ql-editor, div.ql-editor, " +
+        "div[contenteditable='true'][role='textbox'], input-area-v2 textarea, rich-textarea textarea";
+
+    IPlaywright? playwright = null;
+    IPage? page = null;
+    try
+    {
+        playwright = await Playwright.CreateAsync();
+        var context = await AnsiConsole.Status().StartAsync("Starting embedded browser...",
+            async _ => await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true));
+        page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+
+        // The composer exists even when signed OUT (Gemini's anonymous chat
+        // mode), so detect sign-in by the absence of signed-out chrome.
+        async Task<bool> OpenAndCheckSignedInAsync(int timeoutMs)
+        {
+            // Gemini keeps connections open that stop the window 'load' event from
+            // ever firing (GotoAsync's default wait), so navigation would time out
+            // on a perfectly usable page — wait only for DOMContentLoaded and let
+            // the element wait below decide readiness.
+            await page!.GotoAsync(appUrl, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 60000
+            });
+            // Wait for the app shell itself (<chat-app>) rather than a specific
+            // composer variant, then let the header/sidebar settle before reading.
+            // State=Attached: a union wait resolves to the FIRST match in DOM order,
+            // and Google's header contains hidden sign-in anchors that would never
+            // become visible — waiting for visibility deadlocks on them.
+            await page.WaitForSelectorAsync(
+                $"chat-app, {editorSelector}, a[href*='accounts.google.com'], input[type='email']",
+                new PageWaitForSelectorOptions { State = WaitForSelectorState.Attached, Timeout = timeoutMs });
+            await Task.Delay(2000);
+            // Only Gemini's OWN signed-out markers count. Generic checks (like any
+            // accounts.google.com anchor) misfire: signed-in pages carry account
+            // links too ("Manage your Google Account" etc.).
+            return await page.EvaluateAsync<bool>(
+                "() => !document.querySelector(\"[data-test-id='signed-out-disclaimer'], " +
+                "[data-test-id='mavatar-sign-in-icon-button']\")");
+        }
+
+        var signedIn = await AnsiConsole.Status().StartAsync("Opening Gemini...",
+            async _ => await OpenAndCheckSignedInAsync(45000));
+
+        for (var attempt = 1; !signedIn; attempt++)
+        {
+            // Same story as Google Messages pairing: Google sign-in refuses any
+            // browser with an automation debugger attached, so sign in with a
+            // plain Chrome window on the same profile, then read it headlessly.
+            // Crucially, VERIFY the session stuck before proceeding — a window
+            // closed too early leaves the profile signed out.
+            await context.DisposeAsync();
+            await Task.Delay(1500); // let Chrome fully release the profile first
+
+            AnsiConsole.MarkupLine(attempt == 1
+                ? "[yellow]This computer isn't signed into Gemini yet.[/]"
+                : "[yellow]Gemini still shows signed out — the session didn't stick. Let's try again.[/]");
+            AnsiConsole.MarkupLine(
+                "[grey]A regular Chrome window will open (no automation, so Google sign-in works).\n" +
+                "Click 'Sign in' and sign into your Google account. Wait until the Gemini chat\n" +
+                "screen shows your account avatar (top right) and your conversation history in\n" +
+                "the sidebar, then close ALL windows of that browser to continue here.[/]\n");
+            PauseForKey();
+
+            var browserExe = FindBrowserExe();
+            AnsiConsole.MarkupLine($"[grey]Opening {Markup.Escape(Path.GetFileName(browserExe))}...[/]");
+            var signinWatch = Stopwatch.StartNew();
+            var signinProc = Process.Start(new ProcessStartInfo(browserExe,
+                $"--user-data-dir=\"{profileDir}\" --no-first-run --no-default-browser-check --new-window {appUrl}")
+            {
+                UseShellExecute = false
+            });
+            AnsiConsole.MarkupLine("[grey]Waiting for you to sign in and close the browser window...[/]");
+            if (signinProc != null) await signinProc.WaitForExitAsync();
+            if (signinWatch.Elapsed < TimeSpan.FromSeconds(3))
+            {
+                // An instant exit means the launch handed off to a browser process
+                // already holding this profile (possibly a hidden one) — the user
+                // never saw a window.
+                AnsiConsole.MarkupLine(
+                    "[yellow]The browser closed immediately, so you probably never saw a window.\n" +
+                    "Another browser process is likely holding the Gemini profile — close all\n" +
+                    "Chrome/Edge windows (check the system tray too), then retry.[/]\n");
+            }
+            await Task.Delay(1500); // and release it again before the headless relaunch
+
+            context = await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true);
+            page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            signedIn = await AnsiConsole.Status().StartAsync("Checking sign-in...",
+                async _ => await OpenAndCheckSignedInAsync(60000));
+
+            if (!signedIn && attempt >= 3)
+                throw new InvalidOperationException(
+                    "Gemini still shows signed out after three sign-in attempts. Delete the " +
+                    "'gemini-profile' folder next to the app and try once more.");
+        }
+
+        try
+        {
+            const string newChat = "== New conversation ==";
+            const string showMore = "== Show more history ==";
+            const string refresh = "== Refresh ==";
+            const string apiChats = "== Local API-key chats ==";
+            const string snapshot = "== Save debug snapshot ==";
+            var lastIdx = 0;
+            while (true)
+            {
+                var conversations = await AnsiConsole.Status().StartAsync("Loading conversations...",
+                    async _ => await ScrapeGeminiConversationsAsync(page!));
+
+                AnsiConsole.Clear();
+                AnsiConsole.MarkupLine("[bold blue]Gemini[/] [grey]— gemini.google.com[/]");
+                if (conversations.Count == 0)
+                    AnsiConsole.MarkupLine(
+                        "[yellow]No conversation history found (new account, or the page layout changed).[/]");
+
+                var options = new List<string> { newChat };
+                options.AddRange(conversations.Select(Markup.Escape));
+                if (conversations.Count > 0) options.Add(showMore);
+                options.Add(refresh);
+                if (GeminiApi.ApiKey != null) options.Add(apiChats);
+                options.Add(snapshot);
+                options.Add("<= Back to Main Menu");
+
+                var idx = PromptMenu("Select a conversation:", options, 15,
+                    initialSelected: Math.Min(lastIdx, options.Count - 1));
+                if (idx < 0 || idx == options.Count - 1) break;
+                lastIdx = idx;
+
+                if (options[idx] == newChat)
+                {
+                    // A fresh /app page IS a new conversation; first message opens it.
+                    await AnsiConsole.Status().StartAsync("Starting a new conversation...", async _ =>
+                    {
+                        await page.GotoAsync(appUrl, new PageGotoOptions
+                        {
+                            WaitUntil = WaitUntilState.DOMContentLoaded,
+                            Timeout = 60000
+                        });
+                        await page.WaitForSelectorAsync(editorSelector,
+                            new PageWaitForSelectorOptions { State = WaitForSelectorState.Attached, Timeout = 30000 });
+                    });
+                    if (await SendGeminiWebMessageAsync(page))
+                        await ShowGeminiWebThreadAsync(page, "New conversation");
+                    continue;
+                }
+
+                if (options[idx] == showMore)
+                {
+                    try
+                    {
+                        await AnsiConsole.Status().StartAsync("Loading more history...", async _ =>
+                        {
+                            await page.Locator(
+                                    "[data-test-id='show-more-button']:visible, button:has-text('Show more'):visible").First
+                                .ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+                            await Task.Delay(1200);
+                        });
+                    }
+                    catch
+                    {
+                        AnsiConsole.MarkupLine("[yellow]Couldn't find a 'Show more' control in the sidebar.[/]");
+                        PauseForKey();
+                    }
+                    continue;
+                }
+
+                if (options[idx] == refresh)
+                {
+                    await AnsiConsole.Status().StartAsync("Refreshing...", async _ =>
+                    {
+                        await page.GotoAsync(appUrl, new PageGotoOptions
+                        {
+                            WaitUntil = WaitUntilState.DOMContentLoaded,
+                            Timeout = 60000
+                        });
+                        await page.WaitForSelectorAsync(editorSelector,
+                            new PageWaitForSelectorOptions { State = WaitForSelectorState.Attached, Timeout = 30000 });
+                    });
+                    continue;
+                }
+
+                if (options[idx] == apiChats)
+                {
+                    await ShowGeminiApiChatsAsync();
+                    continue;
+                }
+
+                if (options[idx] == snapshot)
+                {
+                    await DumpPageDiagnosticsAsync(page, "gemini", await ProbeGeminiPageAsync(page));
+                    PauseForKey();
+                    continue;
+                }
+
+                var convIndex = idx - 1; // options[0] is newChat
+                await AnsiConsole.Status().StartAsync("Opening conversation...", async _ =>
+                {
+                    // Same item selector (and visibility filter) that
+                    // ScrapeGeminiConversationsAsync uses, so Nth(convIndex) lines
+                    // up with the scraped titles.
+                    await page.Locator(
+                            "[data-test-id='conversation']:visible, .conversation-items-container .conversation:visible")
+                        .Nth(convIndex)
+                        .ClickAsync(new LocatorClickOptions { Timeout = 10000 });
+                    await Task.Delay(1000); // let the thread swap in before reading it
+                    await page.WaitForSelectorAsync("user-query, model-response",
+                        new PageWaitForSelectorOptions { State = WaitForSelectorState.Attached, Timeout = 30000 });
+                });
+                await ShowGeminiWebThreadAsync(page, conversations[convIndex]);
+                // Returning to the list is just re-scraping the sidebar (still loaded).
+            }
+        }
+        finally
+        {
+            await context.DisposeAsync();
+        }
+        AnsiConsole.Clear();
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine(
+            $"[red]Gemini browser error:[/] {Markup.Escape(ex.Message)}\n" +
+            "[grey]If sign-in broke or the page changed, delete the 'gemini-profile' folder " +
+            "next to the app and sign in again.[/]\n");
+        await DumpPageDiagnosticsAsync(page, "gemini", await ProbeGeminiPageAsync(page));
+        PauseForKey();
+    }
+    finally
+    {
+        playwright?.Dispose();
+    }
+}
+
+// A deep structural probe of the Gemini page for the debug dump: every composer
+// candidate, menu/send button, sidebar item counts and a sample of their HTML —
+// so selector fixes can be made from one dump instead of guesswork.
+static async Task<string?> ProbeGeminiPageAsync(IPage? page)
+{
+    if (page == null) return null;
+    try
+    {
+        return await page.EvaluateAsync<string>(
+            @"() => {
+                const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+                const brief = e => ({
+                    tag: e.tagName.toLowerCase(),
+                    testId: e.getAttribute('data-test-id'),
+                    aria: e.getAttribute('aria-label'),
+                    cls: (e.className || '').toString().slice(0, 50),
+                    visible: vis(e)
+                });
+                const convSel = '[data-test-id=""conversation""], .conversation-items-container .conversation';
+                const conv = Array.from(document.querySelectorAll(convSel));
+                const sidenav = document.querySelector('conversations-list, side-navigation-content, bard-sidenav');
+                return JSON.stringify({
+                    signedOutDisclaimer: !!document.querySelector(""[data-test-id='signed-out-disclaimer']""),
+                    mavatarSignIn: !!document.querySelector(""[data-test-id='mavatar-sign-in-icon-button']""),
+                    editors: Array.from(document.querySelectorAll(
+                        ""div.ql-editor, rich-textarea, textarea, div[contenteditable='true']"")).map(brief),
+                    menuButtons: Array.from(document.querySelectorAll('button, side-nav-menu-button'))
+                        .filter(b => /menu/i.test((b.getAttribute('aria-label') || '') + (b.getAttribute('data-test-id') || '')))
+                        .map(brief),
+                    sendButtons: Array.from(document.querySelectorAll('button'))
+                        .filter(b => /send|submit/i.test(b.getAttribute('aria-label') || '')).map(brief),
+                    convCount: conv.length,
+                    convVisible: conv.filter(vis).length,
+                    convSampleHtml: conv.length ? conv[0].outerHTML.slice(0, 800) : null,
+                    sidenavText: sidenav ? (sidenav.innerText || '').slice(0, 400) : null,
+                    sidenavHtml: sidenav ? sidenav.outerHTML.slice(0, 1500) : null,
+                    userQueries: document.querySelectorAll('user-query').length,
+                    modelResponses: document.querySelectorAll('model-response').length,
+                    messageContents: document.querySelectorAll('message-content').length
+                }, null, 1);
+            }");
+    }
+    catch
+    {
+        return null; // the probe is best-effort diagnostics
+    }
+}
+
+// Titles of the sidebar's recent conversations, top first. If none are visible
+// the side nav may be collapsed — toggling the menu button usually reveals it.
+static async Task<List<string>> ScrapeGeminiConversationsAsync(IPage page)
+{
+    async Task<List<string>> ReadAsync()
+    {
+        // Hidden items are skipped so the indexes line up with the :visible
+        // click locator in the caller.
+        var json = await page.EvaluateAsync<string>(
+            @"() => JSON.stringify(Array.from(document.querySelectorAll(
+                '[data-test-id=""conversation""], .conversation-items-container .conversation'
+            )).filter(e => {
+                const r = e.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }).map(e =>
+                ((e.querySelector('.conversation-title') || e).innerText || '').split('\n')[0].trim()
+            ))");
+        return (JsonSerializer.Deserialize<List<string>>(json) ?? [])
+            .Select(t => t.Length > 0 ? t : "(untitled)").ToList();
+    }
+
+    var items = await ReadAsync();
+    // The sidebar history loads asynchronously (a spinner shows first), so an
+    // instant read comes back empty even when signed in — poll briefly, and
+    // half-way through try expanding a collapsed side nav.
+    for (var i = 0; items.Count == 0 && i < 10; i++)
+    {
+        if (i == 4)
+        {
+            try
+            {
+                // The toggle may be the native button, Gemini's custom element,
+                // or a test-id'd wrapper — clicking any of them works.
+                await page.Locator(
+                        "side-nav-menu-button:visible, chat-app-side-nav-menu-button:visible, " +
+                        "[data-test-id='side-nav-menu-button']:visible, button[aria-label*='menu' i]:visible").First
+                    .ClickAsync(new LocatorClickOptions { Timeout = 3000 });
+            }
+            catch
+            {
+                // No menu button found — keep polling; the caller shows a hint.
+            }
+        }
+        await Task.Delay(1000);
+        items = await ReadAsync();
+    }
+    return items;
+}
+
+// The open conversation's turns, oldest first, as user/model pairs. Prefers the
+// inner content nodes so button labels and icon text don't leak into the text.
+static async Task<List<(string Role, string Text)>> ScrapeGeminiThreadAsync(IPage page)
+{
+    var json = await page.EvaluateAsync<string>(
+        @"() => JSON.stringify(Array.from(document.querySelectorAll('user-query, model-response')).map(e => {
+            const inner = e.querySelector('message-content, .query-text');
+            return {
+                role: e.tagName.toLowerCase() === 'user-query' ? 'user' : 'model',
+                text: ((inner || e).innerText || '').trim()
+            };
+        }).filter(m => m.text.length > 0))");
+
+    var list = new List<(string, string)>();
+    using var doc = JsonDocument.Parse(json);
+    foreach (var m in doc.RootElement.EnumerateArray())
+        list.Add((m.GetProperty("role").GetString() ?? "model", m.GetProperty("text").GetString() ?? ""));
+    return list;
+}
+
+// The open conversation in the pager; R composes the next message, F5 re-reads
+// the page (e.g. after answering on another device).
+static async Task ShowGeminiWebThreadAsync(IPage page, string title)
+{
+    while (true)
+    {
+        var messages = await AnsiConsole.Status().StartAsync("Reading conversation...",
+            async _ => await ScrapeGeminiThreadAsync(page));
+
+        var sb = new StringBuilder();
+        if (messages.Count == 0) sb.Append("[grey]Nothing readable here — the page layout may have changed.[/]\n");
+        foreach (var (role, text) in messages)
+        {
+            var (name, color) = role == "user" ? ("You", "cyan") : ("Gemini", "magenta");
+            sb.Append($"[bold {color}]{name}[/]\n");
+            sb.Append(Markup.Escape(text)).Append("\n\n");
+        }
+
+        var panel = new Panel(new Markup(sb.ToString().TrimEnd('\n')))
+        {
+            Header = new PanelHeader($" {Markup.Escape(title)} "),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 0, 1, 0),
+            Expand = true
+        };
+
+        var key = ShowInPager(panel, actions: [(ConsoleKey.R, "R send"), (ConsoleKey.F5, "F5 refresh")],
+            startAtEnd: true);
+        if (key == ConsoleKey.F5) continue;
+        if (key != ConsoleKey.R) return;
+        await SendGeminiWebMessageAsync(page);
+    }
+}
+
+// Prompts for one message, types it into Gemini's composer, and waits for the
+// streamed reply to finish. False when the composer was left blank or the send
+// failed — for a new conversation that means there is no thread to show.
+static async Task<bool> SendGeminiWebMessageAsync(IPage page)
+{
+    var text = PromptReplyLine("[green]Message Gemini[/] [grey](leave blank to cancel):[/]");
+    if (text.Length == 0) return false;
+
+    try
+    {
+        await AnsiConsole.Status().StartAsync("Gemini is thinking...", async _ =>
+        {
+            // Same union the reply-watcher counts, so before/after line up.
+            var before = await page.EvaluateAsync<int>(
+                "() => document.querySelectorAll('model-response, message-content, response-container').length");
+
+            var editor = page.Locator(
+                "rich-textarea div.ql-editor:visible, div.ql-editor:visible, " +
+                "div[contenteditable='true'][role='textbox']:visible, " +
+                "input-area-v2 textarea:visible, rich-textarea textarea:visible").First;
+            await editor.ClickAsync(new LocatorClickOptions { Timeout = 10000 });
+            // Real keystrokes: Quill's model ignores DOM-injected text, so the
+            // app would treat a Fill'd composer as empty and refuse to send.
+            await page.Keyboard.TypeAsync(text);
+
+            // Prefer the send button ("Send message"); Enter covers relabels.
+            try
+            {
+                await page.Locator("button[aria-label*='Send' i]:visible, button.send-button:visible").First
+                    .ClickAsync(new LocatorClickOptions { Timeout = 3000 });
+            }
+            catch
+            {
+                await page.Keyboard.PressAsync("Enter");
+            }
+
+            // A send that registered empties the composer; if the text is still
+            // sitting there, retry with Enter once, then fail loudly instead of
+            // burning the whole reply timeout.
+            // Read back the SAME element that was typed into — pages can hold
+            // several composer elements, and reading a different (empty, hidden)
+            // one made failed sends look successful.
+            async Task<string> ComposerTextAsync()
+            {
+                try { return (await editor.InnerTextAsync(new LocatorInnerTextOptions { Timeout = 3000 })).Trim(); }
+                catch { return ""; } // composer gone (page re-rendered) counts as sent
+            }
+            await Task.Delay(1500);
+            var leftover = await ComposerTextAsync();
+            if (leftover.Length > 0)
+            {
+                await page.Keyboard.PressAsync("Enter");
+                await Task.Delay(1500);
+                leftover = await ComposerTextAsync();
+                if (leftover.Length > 0)
+                    throw new InvalidOperationException(
+                        "Gemini didn't accept the message — the composer kept the text.");
+            }
+
+            await WaitForGeminiReplyAsync(page, before);
+        });
+        return true;
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Couldn't send:[/] {Markup.Escape(ex.Message)}\n");
+        // The dump captures the conversation view's actual element names, which
+        // is exactly what's needed when the reply-detection selectors miss.
+        await DumpPageDiagnosticsAsync(page, "gemini", await ProbeGeminiPageAsync(page));
+        PauseForKey();
+        return false;
+    }
+}
+
+// A reply is finished when a new model-response exists, has text, the text has
+// stopped growing (it streams in), and no Stop control remains on the page.
+static async Task WaitForGeminiReplyAsync(IPage page, int responsesBefore)
+{
+    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
+    var last = "";
+    var stablePolls = 0;
+    while (DateTime.UtcNow < deadline)
+    {
+        await Task.Delay(1000);
+        var state = await page.EvaluateAsync<string>(
+            @"() => {
+                const rs = document.querySelectorAll('model-response, message-content, response-container');
+                const t = rs.length ? (rs[rs.length - 1].innerText || '').trim() : '';
+                const busy = !!document.querySelector('button[aria-label*=""Stop"" i]');
+                return JSON.stringify({ count: rs.length, len: t.length, tail: t.slice(-200), busy });
+            }");
+        using var doc = JsonDocument.Parse(state);
+        var root = doc.RootElement;
+        if (root.GetProperty("count").GetInt32() <= responsesBefore ||
+            root.GetProperty("len").GetInt32() == 0) continue;
+
+        var snapshot = root.GetProperty("len").GetInt32() + "" + root.GetProperty("tail").GetString();
+        if (!root.GetProperty("busy").GetBoolean() && snapshot == last)
+        {
+            if (++stablePolls >= 2) return;
+        }
+        else
+        {
+            stablePolls = 0;
+        }
+        last = snapshot;
+    }
+    throw new InvalidOperationException(
+        "Timed out waiting for Gemini's reply (3 minutes) — the page may have changed, or the prompt was blocked.");
+}
+
+// Local API-key chats: the original API-based mode (see GeminiApi), reachable
+// from the Gemini list when a key is configured in Settings > Gemini.
+static async Task ShowGeminiApiChatsAsync()
+{
+    const string newChat = "== New conversation ==";
+    const string deleteChat = "== Delete a conversation ==";
+    var lastIdx = 0;
+    while (true)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine($"[bold blue]Gemini[/] [grey]— local API chats ({Markup.Escape(GeminiApi.Model)})[/]");
+
+        var chats = GeminiChat.LoadAll();
+        var options = new List<string> { newChat };
+        options.AddRange(chats.Select(c =>
+            $"{Markup.Escape(c.Title)}  [grey]{c.Updated:MMM d, h:mm tt} • {c.Messages.Count} messages[/]"));
+        if (chats.Count > 0) options.Add(deleteChat);
+        options.Add("<= Back");
+
+        var idx = PromptMenu("Select a conversation:", options, 15,
+            initialSelected: Math.Min(lastIdx, options.Count - 1));
+        if (idx < 0 || idx == options.Count - 1) break;
+        lastIdx = idx;
+
+        if (options[idx] == newChat)
+        {
+            await ShowGeminiChatAsync(GeminiChat.CreateNew());
+            continue;
+        }
+
+        if (options[idx] == deleteChat)
+        {
+            AnsiConsole.Clear();
+            AnsiConsole.MarkupLine("[bold blue]Gemini[/] [grey]— delete a conversation[/]");
+            var delOptions = chats.Select(c =>
+                $"{Markup.Escape(c.Title)}  [grey]{c.Updated:MMM d, h:mm tt}[/]").ToList();
+            delOptions.Add("<= Cancel");
+            var del = PromptMenu("[red]Delete which conversation?[/]", delOptions, 15);
+            if (del >= 0 && del < chats.Count) chats[del].Delete();
+            continue;
+        }
+
+        await ShowGeminiChatAsync(chats[idx - 1]); // options[0] is newChat
+    }
+    AnsiConsole.Clear();
+}
+
+// One conversation in the pager, oldest first; R composes the next message.
+// A brand-new conversation opens straight into the composer.
+static async Task ShowGeminiChatAsync(GeminiChat chat)
+{
+    if (chat.Messages.Count == 0 && !await SendGeminiMessageAsync(chat)) return;
+
+    while (true)
+    {
+        var sb = new StringBuilder();
+        foreach (var m in chat.Messages)
+        {
+            var (name, color) = m.Role == "user" ? ("You", "cyan") : ("Gemini", "magenta");
+            sb.Append($"[bold {color}]{name}[/]  [grey]{m.Time:MMM d, h:mm tt}[/]\n");
+            sb.Append(Markup.Escape(m.Text)).Append("\n\n");
+        }
+
+        var panel = new Panel(new Markup(sb.ToString().TrimEnd('\n')))
+        {
+            Header = new PanelHeader($" {Markup.Escape(chat.Title.Length > 0 ? chat.Title : "New conversation")} "),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 0, 1, 0),
+            Expand = true
+        };
+
+        var key = ShowInPager(panel, actions: [(ConsoleKey.R, "R send")], startAtEnd: true);
+        if (key != ConsoleKey.R) return;
+        await SendGeminiMessageAsync(chat);
+    }
+}
+
+// Prompts for one message, sends the whole conversation to Gemini (the API is
+// stateless), and saves the exchange. False when the composer was left blank
+// or a brand-new conversation errored before its first reply.
+static async Task<bool> SendGeminiMessageAsync(GeminiChat chat)
+{
+    var text = PromptReplyLine("[green]Message Gemini[/] [grey](leave blank to cancel):[/]");
+    if (text.Length == 0) return chat.Messages.Count > 0;
+
+    chat.Messages.Add(new GeminiMessage("user", text, DateTime.Now));
+    try
+    {
+        var reply = await AnsiConsole.Status().StartAsync("Gemini is thinking...",
+            async _ => await GeminiApi.ChatAsync(chat.Messages));
+        chat.Messages.Add(new GeminiMessage("model", reply, DateTime.Now));
+    }
+    catch (Exception ex)
+    {
+        chat.Messages.RemoveAt(chat.Messages.Count - 1); // don't keep the unanswered turn
+        AnsiConsole.MarkupLine($"[red]Gemini error:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return chat.Messages.Count > 0;
+    }
+    chat.Save();
+    return true;
+}
+
 // Discord section: servers -> channels (with unread/mention badges) -> messages.
 // All state comes from one gateway snapshot per visit (see DiscordApi); marking
 // a channel read updates both Discord and the local snapshot.
@@ -5457,22 +6811,7 @@ static async Task ShowDiscordAsync()
         return;
     }
 
-    async Task<DiscordState?> ConnectAsync(string label)
-    {
-        try
-        {
-            return await AnsiConsole.Status().StartAsync(label,
-                async _ => await DiscordApi.FetchStateAsync());
-        }
-        catch (Exception ex)
-        {
-            AnsiConsole.MarkupLine($"[red]Discord error:[/] {Markup.Escape(ex.Message)}\n");
-            PauseForKey();
-            return null;
-        }
-    }
-
-    var state = await ConnectAsync("Connecting to Discord...");
+    var state = await TryFetchDiscordStateAsync("Connecting to Discord...");
     if (state == null) return;
 
     var lastIdx = 0;
@@ -5493,22 +6832,47 @@ static async Task ShowDiscordAsync()
         options.Add(refresh);
         options.Add("<= Back to Main Menu");
 
-        var idx = PromptMenu("Select a server:", options, 15, initialSelected: lastIdx);
+        var idx = PromptMenu("Select a server:", options, 15, initialSelected: lastIdx,
+            autoRefresh: MessagesAutoRefresh());
+        if (MenuTimedOut(idx, ref lastIdx))
+        {
+            state = await TryFetchDiscordStateAsync("Refreshing...") ?? state;
+            continue;
+        }
         if (idx < 0 || idx == options.Count - 1) break;
 
         if (options[idx] == refresh)
         {
-            state = await ConnectAsync("Refreshing...") ?? state;
+            state = await TryFetchDiscordStateAsync("Refreshing...") ?? state;
             continue;
         }
 
         lastIdx = idx;
-        await ShowDiscordChannelsAsync(state, state.Guilds[idx]);
+        state = await ShowDiscordChannelsAsync(state, state.Guilds[idx]);
     }
     AnsiConsole.Clear();
 }
 
-static async Task ShowDiscordChannelsAsync(DiscordState state, DiscordGuild guild)
+// One gateway snapshot fetch behind a spinner; shows the error and returns
+// null on failure so the caller can keep its previous state.
+static async Task<DiscordState?> TryFetchDiscordStateAsync(string label)
+{
+    try
+    {
+        return await AnsiConsole.Status().StartAsync(label,
+            async _ => await DiscordApi.FetchStateAsync());
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Discord error:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return null;
+    }
+}
+
+// Returns the current state, which may be a fresher snapshot than the one
+// passed in if the channel list auto-refreshed while idle.
+static async Task<DiscordState> ShowDiscordChannelsAsync(DiscordState state, DiscordGuild guild)
 {
     // DM "channels" are people, not #channels.
     var prefix = guild.Id.Length == 0 ? "" : "#";
@@ -5534,8 +6898,23 @@ static async Task ShowDiscordChannelsAsync(DiscordState state, DiscordGuild guil
         }).ToList();
         options.Add("<= Back to Servers");
 
-        var idx = PromptMenu("Select a channel:", options, 15, initialSelected: lastIdx);
-        if (idx < 0 || idx == options.Count - 1) return;
+        var idx = PromptMenu("Select a channel:", options, 15, initialSelected: lastIdx,
+            autoRefresh: MessagesAutoRefresh());
+        if (MenuTimedOut(idx, ref lastIdx))
+        {
+            // A fresh snapshot updates the unread/mention badges. If the guild
+            // is gone from it (left/removed), fall back to the servers list.
+            var fresh = await TryFetchDiscordStateAsync("Refreshing...");
+            if (fresh != null)
+            {
+                var current = fresh.Guilds.FirstOrDefault(g => g.Id == guild.Id);
+                if (current == null) return fresh;
+                state = fresh;
+                guild = current;
+            }
+            continue;
+        }
+        if (idx < 0 || idx == options.Count - 1) return state;
         lastIdx = idx;
         await ShowDiscordChannelAsync(state, guild, guild.Channels[idx]);
     }
@@ -5596,12 +6975,19 @@ static async Task ShowDiscordChannelAsync(DiscordState state, DiscordGuild guild
 
         var actions = new List<(ConsoleKey Key, string Hint)>
         {
-            (ConsoleKey.R, "R post"), (ConsoleKey.L, "L older")
+            (ConsoleKey.R, "R post"), (ConsoleKey.L, "L older"), (ConsoleKey.F5, "F5 refresh")
         };
         if (dividerShown) actions.Add((ConsoleKey.M, "M mark read"));
 
         var key = ShowInPager(panel, links, actions.ToArray(),
-            startAtEnd: !dividerShown, startAtText: dividerShown ? "NEW MESSAGES" : null);
+            startAtEnd: !dividerShown, startAtText: dividerShown ? "NEW MESSAGES" : null,
+            autoRefresh: MessagesAutoRefresh());
+
+        if (key == ConsoleKey.F5) // idle timeout or manual — pull the latest messages
+        {
+            messages = await FetchAsync("Refreshing...") ?? messages;
+            continue;
+        }
 
         if (key == ConsoleKey.R)
         {

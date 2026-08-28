@@ -12,13 +12,15 @@ few calendar events (fetched in the background so the menu never waits).
 
 **News & newsletters**
 - Preloaded RSS feeds (NYT Top Stories, NYT U.S., BBC, NPR, AP,
-  Webster-Kirkwood Times) plus any custom RSS URL.
+  Webster-Kirkwood Times) plus any custom RSS URL. Entering a plain website
+  (e.g. `seedsing.com`) scans it for feeds — autodiscovery tags, common feed
+  paths, and Squarespace's `?format=rss` — and lets you pick one. After
+  reading a custom or discovered feed, the app offers to add it to your
+  sources permanently.
 - Email newsletters read in full text straight from Gmail over IMAP
   (e.g. NYT's The Morning, STLPR's The Gateway) — configurable.
 - Subreddits: type `r/anything` as a custom source. With free Reddit API
   credentials configured, posts include scores and comments.
-- Connect your NYT account (embedded browser sign-in) to read full subscriber
-  articles in the terminal.
 
 **Weather** — location search via Open-Meteo geocoding, forecasts from
 weather.gov with Open-Meteo as a fallback/supplement.
@@ -39,9 +41,18 @@ you're caught up), load older history, post messages, and mark channels read
 (read state syncs back to your other Discord clients). Uses your own account
 token; see the caution below.
 
+**Gemini** — chat with Google Gemini through an embedded browser signed into
+your own Google account (one-time sign-in window, like the text-message
+pairing): browse your real gemini.google.com conversation history, resume a
+conversation, or start a new one — using your Google AI Pro plan's limits.
+With an API key configured ([AI Studio](https://aistudio.google.com/app/apikey)),
+a "Local API-key chats" mode is also available (official API, conversations
+saved in `data/gemini/`).
+
 **Games** — the NYT games, playable at the keyboard: Wordle, The Mini/The
 Midi/full-size Daily crossword, Connections, Strands, and Spelling Bee.
-Progress syncs to your NYT account in the background when connected.
+Connect your NYT account from this menu (embedded browser sign-in) and
+progress syncs to it in the background.
 
 ## Requirements
 
@@ -69,11 +80,13 @@ integrations you want.
 | --- | --- | --- |
 | `[gmail-imap]` | Newsletters, email inbox | Gmail address + [app password](https://myaccount.google.com/apppasswords), one or more accounts |
 | `[newsletters]` | Custom newsletter list | `Label \| from-address filter \| subject filter (optional)` per line |
+| `[news-sources]` | Preloaded News menu feeds | `Name \| RSS URL` per line |
 | `[calendar]` | Agenda + menu header | iCal URLs, optionally `Label \| URL` |
 | `[reddit-oauth]` | Reddit scores/comments | Client id + secret from a free 'script' app at reddit.com/prefs/apps |
 | `[nyt-cookies]` | Full NYT article text | Your nytimes.com Cookie header (or use the in-app "Connect NYT account") |
 | `[discord]` | Discord section | Your Discord user token (instructions in Settings) |
-| `[display]` | Menu header tweaks | `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`); `agenda-hide-events` hides events whose title contains a listed name |
+| `[gemini]` | Gemini chat | Nothing needed for the browser mode (sign in on first use); optional API key from [AI Studio](https://aistudio.google.com/app/apikey) + `model = ...` for local API chats |
+| `[display]` | Menu header tweaks | `clock`, `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`); `agenda-hide-events` hides events whose title contains a listed name |
 
 Files the app generates (caches, game progress, logs, browser profiles) are
 kept in a `data/` subfolder.
@@ -91,6 +104,10 @@ read).
   token. Discord's Terms of Service forbid automating a user account; this app
   keeps usage minimal (read messages, send read-receipts, post what you type),
   but use it at your own discretion.
+- **Gemini**: the browser mode automates the gemini.google.com web app with
+  your signed-in Google session — an unofficial, scraping-based integration
+  that can break when Google changes the page, and automating a consumer
+  Google service may be against its terms. Use at your own discretion.
 - **Credentials** in `config.txt` (app passwords, cookies, tokens) are stored
   in plain text next to the exe — keep the folder private and don't commit it
   anywhere.
@@ -104,3 +121,6 @@ read).
   folder to re-pair from scratch.
 - If the Discord server list fails to parse, the raw payload is saved to
   `data/discord-ready-debug.json`.
+- If Gemini scraping breaks, the app saves `data/gemini-debug.txt` and a
+  screenshot to help fix the selectors; delete the `gemini-profile` folder to
+  sign in from scratch.

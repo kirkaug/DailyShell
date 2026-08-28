@@ -28,6 +28,20 @@ static class Config
             "Label | text the From address must contain | text the Subject must contain (optional)",
             "If empty, built-in defaults are used.",
         ], false),
+        new("news-sources", "News sources",
+        [
+            "Preloaded sources shown in the News menu, one per line:",
+            "Name | RSS feed URL",
+            "If empty, the built-in defaults are used.",
+        ], false,
+        [
+            "NYT Daily Top Stories | https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+            "NYT U.S. News | https://rss.nytimes.com/services/xml/rss/nyt/US.xml",
+            "BBC | http://feeds.bbci.co.uk/news/rss.xml",
+            "NPR | https://feeds.npr.org/1001/rss.xml",
+            "AP | https://feedx.net/rss/ap.xml",
+            "Webster-Kirkwood Times | https://www.timesnewspapers.com/search/?f=rss&t=article&c=webster-kirkwoodtimes&l=50&s=start_time&sd=desc",
+        ]),
         new("calendar", "Calendar feeds",
         [
             "One calendar per line: an iCal URL, or \"Label | URL\".",
@@ -53,9 +67,21 @@ static class Config
             "reads messages, marks channels seen, and posts what you type here,",
             "but the risk is yours.",
         ], false),
+        new("gemini", "Gemini",
+        [
+            "The Gemini section drives gemini.google.com in an embedded browser with",
+            "your own Google account (first use opens a sign-in window), so it shows",
+            "your real Gemini history and uses your AI Pro plan — nothing needed here.",
+            "To also enable the 'Local API-key chats' mode (official API, higher",
+            "reliability, no web history):",
+            "Line 1: a Gemini API key (free at aistudio.google.com/app/apikey).",
+            "Optional: model = gemini-2.5-flash   (the default) to use a different model.",
+            "API chats are saved locally in data/gemini/.",
+        ], false),
         new("display", "Main menu display",
         [
             "key = value settings for the main menu and agenda:",
+            "  clock = on|off         show the current time and date in the menu header",
             "  weather = on|off       show current conditions in the menu header",
             "  agenda = on|off        show upcoming events in the menu header",
             "  agenda-items = 3       how many upcoming events the header shows",
@@ -66,9 +92,11 @@ static class Config
             "  agenda-hide-events =   hide events by name, comma-separated; an event is hidden",
             "                         when its title contains any entry (case-insensitive),",
             "                         e.g. standup, focus time",
+            "  refresh-seconds = 60   how long the message views (texts, Discord, email)",
+            "                         sit idle before auto-refreshing; 0 or off disables it",
             "Missing keys fall back to the defaults shown above.",
         ], false,
-        ["weather = on", "agenda = on", "agenda-items = 3", "agenda-days = 14"]),
+        ["clock = on", "weather = on", "agenda = on", "agenda-items = 3", "agenda-days = 14", "refresh-seconds = 60"]),
     ];
 
     public static readonly string FilePath = Path.Combine(AppContext.BaseDirectory, "config.txt");
