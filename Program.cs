@@ -44,7 +44,9 @@ const string calendarOption = "Calendar agenda";
 const string unreadOption = "Email inbox";
 const string smsOption = "Text messages";
 const string discordOption = "Discord";
+const string webexOption = "Webex";
 const string geminiOption = "Gemini";
+const string obsidianOption = "Obsidian notes";
 const string gamesOption = "Games";
 const string settingsOption = "Settings";
 const string exitOption = "Exit";
@@ -75,7 +77,7 @@ while (true)
     if (headerLines.Count > 0)
         AnsiConsole.MarkupLine(string.Join("\n", headerLines) + "\n");
 
-    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, geminiOption, gamesOption, settingsOption, exitOption };
+    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, webexOption, geminiOption, obsidianOption, gamesOption, settingsOption, exitOption };
 
     // While the header fetch is still running, refreshWhen redraws the menu the
     // moment it lands (so a slow first fetch doesn't leave the header blank until
@@ -130,9 +132,21 @@ while (true)
         continue;
     }
 
+    if (choice == webexOption)
+    {
+        await ShowWebexAsync();
+        continue;
+    }
+
     if (choice == geminiOption)
     {
         await ShowGeminiAsync();
+        continue;
+    }
+
+    if (choice == obsidianOption)
+    {
+        ShowObsidian();
         continue;
     }
 
@@ -7044,6 +7058,589 @@ static async Task ShowDiscordChannelAsync(DiscordState state, DiscordGuild guild
 
         return;
     }
+}
+
+// Webex section: spaces and messages over the official REST API, authorized
+// once via OAuth (Settings > Webex holds the integration's client id/secret;
+// WebexApi handles the sign-in and token refresh). Webex's public API exposes
+// no read state, so unread markers are local — a space is flagged when it has
+// activity since this app last opened it (WebexSeen keeps the markers).
+static async Task ShowWebexAsync()
+{
+    if (WebexApi.Credentials == null)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine(
+            "[yellow]Webex isn't set up yet.[/]\n\n" +
+            "[grey]Create a free integration at developer.webex.com/my-apps and add its\n" +
+            "Client ID and Secret under Settings > Webex (full instructions are shown there).[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    if (!WebexApi.IsLinked && !await LinkWebexAsync()) return;
+
+    var rooms = await TryFetchWebexRoomsAsync("Connecting to Webex...");
+    if (rooms == null) return;
+
+    var lastIdx = 0;
+    const string refresh = "== Refresh ==";
+    while (true)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold blue]Webex[/] [grey]— spaces[/]");
+
+        var options = rooms.Select(r =>
+        {
+            var unread = WebexUnread(r);
+            var name = unread ? $"[bold]{Markup.Escape(r.Title)}[/]" : Markup.Escape(r.Title);
+            return $"{(unread ? "[bold cyan]●[/] " : "  ")}{(r.Direct ? "" : "# ")}{name}" +
+                   (r.LastActivity > DateTimeOffset.MinValue ? $"  [grey]{AgoText(r.LastActivity)}[/]" : "");
+        }).ToList();
+        options.Add(refresh);
+        options.Add("<= Back to Main Menu");
+
+        var idx = PromptMenu("Select a space:", options, 15, initialSelected: lastIdx,
+            autoRefresh: MessagesAutoRefresh());
+        if (MenuTimedOut(idx, ref lastIdx))
+        {
+            rooms = await TryFetchWebexRoomsAsync("Refreshing...") ?? rooms;
+            continue;
+        }
+        if (idx < 0 || idx == options.Count - 1) break;
+
+        if (options[idx] == refresh)
+        {
+            rooms = await TryFetchWebexRoomsAsync("Refreshing...") ?? rooms;
+            continue;
+        }
+
+        lastIdx = idx;
+        await ShowWebexRoomAsync(rooms[idx]);
+    }
+    AnsiConsole.Clear();
+}
+
+// A space counts as unread when it has activity newer than the last time this
+// app showed it (local marker — the public API has no real read state).
+static bool WebexUnread(WebexRoom r) => r.LastActivity > WebexSeen.LastSeen(r.Id);
+
+// Compact "how long ago" badge for the spaces list: now, 5m, 3h, 2d, or a date.
+static string AgoText(DateTimeOffset t)
+{
+    var span = DateTimeOffset.Now - t;
+    return span < TimeSpan.FromMinutes(1) ? "now"
+        : span < TimeSpan.FromHours(1) ? $"{(int)span.TotalMinutes}m"
+        : span < TimeSpan.FromHours(24) ? $"{(int)span.TotalHours}h"
+        : span < TimeSpan.FromDays(7) ? $"{(int)span.TotalDays}d"
+        : t.ToString("MMM d");
+}
+
+// One-time OAuth link: opens the Webex sign-in page in the browser and catches
+// the redirect on a loopback listener. If the listener can't start (port 8442
+// already in use), falls back to pasting the redirected URL by hand — the
+// browser still lands on localhost with the code in the address bar.
+static async Task<bool> LinkWebexAsync()
+{
+    AnsiConsole.Clear();
+    AnsiConsole.MarkupLine("[bold blue]Webex[/] [grey]— one-time sign-in[/]\n");
+
+    var state = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+    var authUrl = WebexApi.BuildAuthUrl(state);
+    var listener = WebexApi.TryStartLoopbackListener();
+
+    string? code = null;
+    if (listener != null)
+    {
+        AnsiConsole.MarkupLine("[grey]A browser window will open — sign in to Webex and approve the access request.[/]\n");
+        OpenInBrowser(authUrl);
+        try
+        {
+            code = await AnsiConsole.Status().StartAsync("Waiting for the browser sign-in (up to 5 minutes)...",
+                async _ =>
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+                    return await WebexApi.WaitForCodeAsync(listener, state, cts.Token);
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[yellow]Timed out waiting for the sign-in.[/]\n");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Webex sign-in failed:[/] {Markup.Escape(ex.Message)}\n");
+        }
+    }
+    else
+    {
+        OpenInBrowser(authUrl);
+        AnsiConsole.MarkupLine(
+            "[grey]Couldn't listen on localhost:8442, so after you approve access the browser\n" +
+            "will show an unreachable-page error — copy that page's full URL (it carries the code).[/]\n");
+        var pasted = PromptReplyLine("[green]Paste the redirected URL here[/] [grey](leave blank to cancel):[/]");
+        if (pasted.Length > 0)
+        {
+            code = WebexApi.CodeFromRedirectUrl(pasted, state);
+            if (code == null)
+                AnsiConsole.MarkupLine("[yellow]That URL didn't contain a matching sign-in code.[/]\n");
+        }
+    }
+
+    if (code == null)
+    {
+        PauseForKey();
+        return false;
+    }
+
+    try
+    {
+        var name = await AnsiConsole.Status().StartAsync("Finishing the Webex link...",
+            async _ =>
+            {
+                await WebexApi.ExchangeCodeAsync(code);
+                return await WebexApi.GetMyNameAsync();
+            });
+        AnsiConsole.MarkupLine($"[green]Webex linked as {Markup.Escape(name)}.[/]\n");
+        return true;
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Couldn't finish the Webex link:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return false;
+    }
+}
+
+// One spaces-list fetch behind a spinner; shows the error and returns null on
+// failure so the caller can keep its previous list. Spaces seen for the first
+// time are baselined as read so a fresh link doesn't flag everything unread.
+static async Task<List<WebexRoom>?> TryFetchWebexRoomsAsync(string label)
+{
+    try
+    {
+        var rooms = await AnsiConsole.Status().StartAsync(label,
+            async _ => await WebexApi.GetRoomsAsync());
+        WebexSeen.BaselineMissing(rooms);
+        return rooms;
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Webex error:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return null;
+    }
+}
+
+static async Task ShowWebexRoomAsync(WebexRoom room)
+{
+    // The divider baseline is what had been seen when the space was opened;
+    // viewing then counts as reading (local read state only), so the marker
+    // moves to "now" on every latest-messages fetch.
+    var seenAt = WebexSeen.LastSeen(room.Id);
+    void MarkSeen() => WebexSeen.MarkSeen(room.Id, DateTimeOffset.Now);
+
+    async Task<List<WebexMessage>?> FetchAsync(string label, string? before = null)
+    {
+        try
+        {
+            return await AnsiConsole.Status().StartAsync(label,
+                async _ => await WebexApi.GetMessagesAsync(room.Id, before));
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Webex error:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return null;
+        }
+    }
+
+    var messages = await FetchAsync("Loading messages...");
+    if (messages == null) return;
+    MarkSeen();
+
+    while (true)
+    {
+        const string divider = "────────────  NEW MESSAGES  ────────────";
+        var sb = new StringBuilder();
+        var dividerShown = false;
+
+        if (messages.Count == 0) sb.Append("[grey]No messages here yet.[/]\n");
+        foreach (var m in messages)
+        {
+            if (!dividerShown && m.Created > seenAt)
+            {
+                sb.Append($"[red]{divider}[/]\n\n");
+                dividerShown = true;
+            }
+            sb.Append($"[bold cyan]{Markup.Escape(m.Author)}[/]  [grey]{m.Created:MMM d, h:mm tt}[/]\n");
+            sb.Append(Markup.Escape(m.Text)).Append("\n\n");
+        }
+
+        var panel = new Panel(new Markup(sb.ToString().TrimEnd('\n')))
+        {
+            Header = new PanelHeader($" {Markup.Escape(room.Title)} "),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 0, 1, 0),
+            Expand = true
+        };
+
+        var actions = new[]
+        {
+            (ConsoleKey.R, "R post"), (ConsoleKey.L, "L older"), (ConsoleKey.F5, "F5 refresh")
+        };
+        var links = BuildLinks([], messages.Select(m => (string?)m.Text).ToArray());
+
+        var key = ShowInPager(panel, links, actions,
+            startAtEnd: !dividerShown, startAtText: dividerShown ? "NEW MESSAGES" : null,
+            autoRefresh: MessagesAutoRefresh());
+
+        if (key == ConsoleKey.F5) // idle timeout or manual — pull the latest messages
+        {
+            messages = await FetchAsync("Refreshing...") ?? messages;
+            MarkSeen();
+            continue;
+        }
+
+        if (key == ConsoleKey.R)
+        {
+            var post = PromptReplyLine(
+                $"[green]Post in {Markup.Escape(room.Title)}[/] [grey](leave blank to cancel):[/]");
+            if (post.Length == 0) continue;
+            try
+            {
+                await AnsiConsole.Status().StartAsync("Posting...",
+                    async _ => await WebexApi.SendMessageAsync(room.Id, post));
+                // Re-fetch so the new post (and anything that arrived since) shows.
+                messages = await FetchAsync("Refreshing...") ?? messages;
+                MarkSeen();
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Couldn't post:[/] {Markup.Escape(ex.Message)}\n");
+                PauseForKey();
+            }
+            continue;
+        }
+
+        if (key == ConsoleKey.L && messages.Count > 0)
+        {
+            var older = await FetchAsync("Loading older messages...", before: messages[0].Id);
+            if (older is { Count: > 0 }) messages.InsertRange(0, older);
+            continue;
+        }
+
+        return;
+    }
+}
+
+// Obsidian section: reads the vault's Markdown straight from disk (no plugin
+// or API — ObsidianVault resolves the vault and daily-note settings from
+// Obsidian's own files). Read-mostly by design: the only write is appending
+// capture lines to today's daily note; real editing happens in the Obsidian
+// app, one E keypress away from any note.
+static void ShowObsidian()
+{
+    var vaults = ObsidianVault.GetVaults();
+    if (vaults.Count == 0)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine(
+            "[yellow]No Obsidian vault found.[/]\n\n" +
+            "[grey]No vaults are registered in Obsidian's settings and none are configured\n" +
+            "under Settings > Obsidian (a vault is just a folder of .md files —\n" +
+            "add its path there to use this section without Obsidian installed).[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    var vault = vaults[0];
+    if (vaults.Count > 1)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold blue]Obsidian[/] [grey]— vaults[/]");
+        var pick = PromptMenu("Select a vault:",
+            vaults.Select(v => $"[bold]{Markup.Escape(v.Name)}[/]  [grey]{Markup.Escape(v.Root)}[/]").ToList());
+        if (pick < 0) return;
+        vault = vaults[pick];
+    }
+
+    const string daily = "[green]Today's daily note[/]";
+    const string search = "[green]Search notes[/]";
+    const string browse = "[green]Browse folders[/]";
+    var lastIdx = 0;
+    while (true)
+    {
+        List<ObsidianNote> recent;
+        try
+        {
+            recent = ObsidianVault.AllNotes(vault).Take(15).ToList();
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Couldn't read the vault:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return;
+        }
+
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine($"[bold blue]Obsidian[/] [grey]— {Markup.Escape(vault.Name)}[/]");
+
+        var options = new List<string> { daily, search, browse };
+        options.AddRange(recent.Select(n =>
+        {
+            var dir = Path.GetDirectoryName(n.RelPath)?.Replace('\\', '/') ?? "";
+            var where = dir.Length > 0 ? $"{Markup.Escape(dir)} · " : "";
+            return $"{Markup.Escape(n.Title)}  [grey]{where}{AgoText(n.Modified)}[/]";
+        }));
+        options.Add("<= Back to Main Menu");
+
+        var idx = PromptMenu("Pick a note or action:", options, 18, initialSelected: lastIdx);
+        if (idx < 0 || idx == options.Count - 1) break;
+        lastIdx = idx;
+
+        if (options[idx] == daily) ShowObsidianDailyNote(vault);
+        else if (options[idx] == search) ShowObsidianSearch(vault);
+        else if (options[idx] == browse) ShowObsidianFolder(vault, "");
+        else ShowObsidianNote(vault, recent[idx - 3]);
+    }
+    AnsiConsole.Clear();
+}
+
+// Folder browser, one level per call (going back pops naturally up the stack).
+static void ShowObsidianFolder(ObsidianVault.Vault vault, string relDir)
+{
+    var lastIdx = 0;
+    while (true)
+    {
+        (List<string> Folders, List<ObsidianNote> Notes) listing;
+        try
+        {
+            listing = ObsidianVault.ListFolder(vault, relDir);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Couldn't read the folder:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return;
+        }
+
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine(
+            $"[bold blue]Obsidian[/] [grey]— {Markup.Escape(relDir.Length == 0 ? vault.Name : relDir)}[/]");
+        if (listing.Folders.Count == 0 && listing.Notes.Count == 0)
+            AnsiConsole.MarkupLine("[yellow]Nothing here.[/]");
+
+        var options = listing.Folders.Select(f => $"[bold]{Markup.Escape(f)}/[/]").ToList();
+        options.AddRange(listing.Notes.Select(n => $"{Markup.Escape(n.Title)}  [grey]{AgoText(n.Modified)}[/]"));
+        options.Add("<= Back");
+
+        var idx = PromptMenu("Open:", options, 18, initialSelected: lastIdx);
+        if (idx < 0 || idx == options.Count - 1) return;
+        lastIdx = idx;
+
+        if (idx < listing.Folders.Count)
+            ShowObsidianFolder(vault, (relDir.Length == 0 ? "" : relDir + "/") + listing.Folders[idx]);
+        else
+            ShowObsidianNote(vault, listing.Notes[idx - listing.Folders.Count]);
+    }
+}
+
+static void ShowObsidianSearch(ObsidianVault.Vault vault)
+{
+    AnsiConsole.Clear();
+    var query = PromptReplyLine("[green]Search notes for[/] [grey](leave blank to cancel):[/]");
+    if (query.Length == 0) return;
+
+    var hits = AnsiConsole.Status().Start("Searching...", _ => ObsidianVault.Search(vault, query));
+    if (hits.Count == 0)
+    {
+        AnsiConsole.MarkupLine($"[yellow]No notes matched \"{Markup.Escape(query)}\".[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    var lastIdx = 0;
+    while (true)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine(
+            $"[bold blue]Obsidian[/] [grey]— {hits.Count} match{(hits.Count == 1 ? "" : "es")} for \"{Markup.Escape(query)}\"[/]");
+
+        var options = hits.Select(h =>
+        {
+            var dir = Path.GetDirectoryName(h.Note.RelPath)?.Replace('\\', '/') ?? "";
+            var detail = h.Snippet.Length > 0 ? h.Snippet : dir;
+            return $"{Markup.Escape(h.Note.Title)}" +
+                   (detail.Length > 0 ? $"  [grey]{Markup.Escape(detail)}[/]" : "");
+        }).ToList();
+        options.Add("<= Back");
+
+        var idx = PromptMenu("Open which note?", options, 15, initialSelected: lastIdx);
+        if (idx < 0 || idx == options.Count - 1) return;
+        lastIdx = idx;
+        ShowObsidianNote(vault, hits[idx].Note);
+    }
+}
+
+static void ShowObsidianNote(ObsidianVault.Vault vault, ObsidianNote note)
+{
+    while (true)
+    {
+        string text;
+        try
+        {
+            text = ObsidianVault.Read(vault, note);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Couldn't read the note:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return;
+        }
+
+        var links = new List<(string Label, string Url)>();
+        var markup = text.Trim().Length == 0 ? "[grey](empty note)[/]" : ObsidianToMarkup(vault, text, links);
+        var panel = new Panel(new Markup(markup))
+        {
+            Header = new PanelHeader($" {Markup.Escape(note.Title)} "),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 0, 1, 0),
+            Expand = true
+        };
+
+        var key = ShowInPager(panel, BuildLinks(links, text),
+            [(ConsoleKey.E, "E open in Obsidian")]);
+        if (key == ConsoleKey.E)
+        {
+            // Reopen the pager afterwards — the loop re-reads the file, so any
+            // edits made over in Obsidian show up on return.
+            OpenInBrowser(ObsidianVault.NoteUri(vault, note.RelPath));
+            continue;
+        }
+        return;
+    }
+}
+
+// Today's daily note as a quick-capture inbox: A appends a timestamped line,
+// creating the note (from the vault's daily-note template, if set) on first use.
+static void ShowObsidianDailyNote(ObsidianVault.Vault vault)
+{
+    while (true)
+    {
+        var relPath = ObsidianVault.DailyNotePath(vault, DateTime.Now);
+        var full = Path.Combine(vault.Root, relPath.Replace('/', Path.DirectorySeparatorChar));
+        var title = Path.GetFileNameWithoutExtension(relPath);
+
+        string text;
+        try
+        {
+            text = File.Exists(full) ? File.ReadAllText(full) : "";
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Couldn't read the daily note:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return;
+        }
+
+        var links = new List<(string Label, string Url)>();
+        var markup = text.Trim().Length == 0
+            ? "[grey]No daily note yet for today — press A to start one.[/]"
+            : ObsidianToMarkup(vault, text, links);
+        var panel = new Panel(new Markup(markup))
+        {
+            Header = new PanelHeader($" {Markup.Escape(title)} — today "),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 0, 1, 0),
+            Expand = true
+        };
+
+        var key = ShowInPager(panel, BuildLinks(links, text),
+            [(ConsoleKey.A, "A append"), (ConsoleKey.E, "E open in Obsidian")], startAtEnd: true);
+
+        if (key == ConsoleKey.A)
+        {
+            var line = PromptReplyLine(
+                $"[green]Append to {Markup.Escape(title)}[/] [grey](leave blank to cancel):[/]");
+            if (line.Length == 0) continue;
+            try
+            {
+                ObsidianVault.AppendToDailyToday(vault, $"- {DateTime.Now:h:mm tt} — {line}");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Couldn't append:[/] {Markup.Escape(ex.Message)}\n");
+                PauseForKey();
+            }
+            continue;
+        }
+        if (key == ConsoleKey.E)
+        {
+            OpenInBrowser(ObsidianVault.NoteUri(vault, relPath));
+            continue;
+        }
+        return;
+    }
+}
+
+// Renders a note's Markdown as Spectre markup, line by line: headings, task
+// checkboxes, blockquotes, and code fences get styling; [[wikilinks]] and
+// [text](url) links are highlighted and added to the pager's link list
+// (wikilinks as obsidian:// jumps, so O follows them into the app). Inline
+// bold/italic markers are left as literal text — safe over styled.
+static string ObsidianToMarkup(ObsidianVault.Vault vault, string text, List<(string Label, string Url)> links)
+{
+    var sb = new StringBuilder();
+    var inCode = false;
+    // Obsidian indents nested lists with tabs. Spectre counts a tab as one
+    // column but the terminal expands it to a tab stop, which shears the
+    // panel border off every indented line — expand them to spaces up front.
+    foreach (var raw in text.Replace("\r\n", "\n").Replace("\t", "    ").Split('\n'))
+    {
+        var trimmed = raw.TrimStart();
+        if (inCode || trimmed.StartsWith("```"))
+        {
+            if (trimmed.StartsWith("```")) inCode = !inCode;
+            sb.Append($"[grey]{Markup.Escape(raw)}[/]\n");
+            continue;
+        }
+
+        // Pull links out before escaping, leaving \x01…\x02 placeholders that
+        // become markup tags afterwards (those bytes never occur in notes).
+        string Styled(string s)
+        {
+            s = Regex.Replace(s, @"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]", m =>
+            {
+                var target = m.Groups[1].Value.Split('#')[0].Trim();
+                var alias = m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value;
+                if (target.Length > 0) links.Add((alias, ObsidianVault.NoteUri(vault, target)));
+                return $"\x01{alias}\x02";
+            });
+            s = Regex.Replace(s, @"\[([^\]]+)\]\((https?://[^)\s]+)\)", m =>
+            {
+                links.Add((m.Groups[1].Value, m.Groups[2].Value));
+                return $"\x01{m.Groups[1].Value}\x02";
+            });
+            return Markup.Escape(s).Replace("\x01", "[underline cyan]").Replace("\x02", "[/]");
+        }
+
+        var heading = Regex.Match(trimmed, @"^(#{1,6})\s+(.*)$");
+        var task = Regex.Match(raw, @"^(\s*)[-*] \[([ xX])\]\s?(.*)$");
+        if (heading.Success)
+            sb.Append(heading.Groups[1].Length == 1
+                ? $"[bold yellow]{Styled(heading.Groups[2].Value)}[/]\n"
+                : $"[bold]{Styled(heading.Groups[2].Value)}[/]\n");
+        else if (task.Success)
+            sb.Append(task.Groups[2].Value == " "
+                ? $"{task.Groups[1].Value}☐ {Styled(task.Groups[3].Value)}\n"
+                : $"{task.Groups[1].Value}[green]☑[/] [dim]{Styled(task.Groups[3].Value)}[/]\n");
+        else if (trimmed.StartsWith('>'))
+            sb.Append($"[grey]{Styled(raw)}[/]\n");
+        else
+            sb.Append(Styled(raw)).Append('\n');
+    }
+    return sb.ToString().TrimEnd('\n');
 }
 
 // The primary Gmail account (the first configured one) — used for newsletter

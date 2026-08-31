@@ -67,6 +67,16 @@ static class Config
             "reads messages, marks channels seen, and posts what you type here,",
             "but the risk is yours.",
         ], false),
+        new("webex", "Webex",
+        [
+            "The Webex section uses an official Webex 'integration' (OAuth). One-time setup:",
+            "1. Sign in at developer.webex.com > My Webex Apps > Create a New App > Integration.",
+            "2. Set the Redirect URI to exactly: http://localhost:8442/webex",
+            "3. Enable the spark:all scope.",
+            "Then fill in here — Line 1: the integration's Client ID. Line 2: its Client Secret.",
+            "The first visit to the Webex section opens a browser sign-in once; tokens are",
+            "kept in data/webex-token.json and refresh themselves from then on.",
+        ], false),
         new("gemini", "Gemini",
         [
             "The Gemini section drives gemini.google.com in an embedded browser with",
@@ -77,6 +87,13 @@ static class Config
             "Line 1: a Gemini API key (free at aistudio.google.com/app/apikey).",
             "Optional: model = gemini-2.5-flash   (the default) to use a different model.",
             "API chats are saved locally in data/gemini/.",
+        ], false),
+        new("obsidian", "Obsidian",
+        [
+            "The Obsidian section reads a vault's Markdown notes straight from disk.",
+            "Usually nothing is needed here — vaults are found from Obsidian's own",
+            "registry (%APPDATA%\\obsidian\\obsidian.json). To override, one vault",
+            "per line: a vault folder path, or: Label | path",
         ], false),
         new("display", "Main menu display",
         [

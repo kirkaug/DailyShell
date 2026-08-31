@@ -1,8 +1,8 @@
 # DailyShell
 
 A personal "morning dashboard" that lives entirely in the terminal: news, email
-newsletters, weather, calendar, email, text messages, Discord, and the NYT
-games — one keyboard-driven app built on .NET and
+newsletters, weather, calendar, email, text messages, Discord, Webex, Obsidian
+notes, and the NYT games — one keyboard-driven app built on .NET and
 [Spectre.Console](https://spectreconsole.net/).
 
 ## Features
@@ -41,6 +41,14 @@ you're caught up), load older history, post messages, and mark channels read
 (read state syncs back to your other Discord clients). Uses your own account
 token; see the caution below.
 
+**Webex** — your Webex spaces and 1:1 chats over the official REST API: browse
+spaces with local unread markers and last-activity times, read messages from a
+NEW MESSAGES divider, load older history, and post replies. One-time OAuth
+sign-in via a free personal integration from
+[developer.webex.com](https://developer.webex.com/my-apps); tokens refresh
+themselves afterwards. (Webex's public API has no read-state endpoint, so
+unread markers are this app's own and don't sync with other Webex clients.)
+
 **Gemini** — chat with Google Gemini through an embedded browser signed into
 your own Google account (one-time sign-in window, like the text-message
 pairing): browse your real gemini.google.com conversation history, resume a
@@ -48,6 +56,14 @@ conversation, or start a new one — using your Google AI Pro plan's limits.
 With an API key configured ([AI Studio](https://aistudio.google.com/app/apikey)),
 a "Local API-key chats" mode is also available (official API, conversations
 saved in `data/gemini/`).
+
+**Obsidian notes** — your Obsidian vault, read straight from disk (no plugin
+or API; the vault is auto-detected from Obsidian's settings): recent notes,
+folder browsing, full-text search, and notes rendered in the terminal with
+headings, task checkboxes, and `[[wikilinks]]` (which `O` follows into the
+Obsidian app). Today's daily note doubles as a quick-capture inbox — `A`
+appends a timestamped line, creating the note from your daily-note template if
+it doesn't exist yet. `E` opens any note in Obsidian itself.
 
 **Games** — the NYT games, playable at the keyboard: Wordle, The Mini/The
 Midi/full-size Daily crossword, Connections, Strands, and Spelling Bee.
@@ -85,7 +101,9 @@ integrations you want.
 | `[reddit-oauth]` | Reddit scores/comments | Client id + secret from a free 'script' app at reddit.com/prefs/apps |
 | `[nyt-cookies]` | Full NYT article text | Your nytimes.com Cookie header (or use the in-app "Connect NYT account") |
 | `[discord]` | Discord section | Your Discord user token (instructions in Settings) |
+| `[webex]` | Webex section | Client ID + secret of a free integration from [developer.webex.com](https://developer.webex.com/my-apps) (redirect URI `http://localhost:8442/webex`, scope `spark:all`); browser sign-in on first use |
 | `[gemini]` | Gemini chat | Nothing needed for the browser mode (sign in on first use); optional API key from [AI Studio](https://aistudio.google.com/app/apikey) + `model = ...` for local API chats |
+| `[obsidian]` | Obsidian notes | Nothing needed (vaults auto-detect); optionally a vault path or `Label \| path` per line |
 | `[display]` | Menu header tweaks | `clock`, `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`); `agenda-hide-events` hides events whose title contains a listed name |
 
 Files the app generates (caches, game progress, logs, browser profiles) are

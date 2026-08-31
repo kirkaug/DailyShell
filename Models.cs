@@ -73,3 +73,15 @@ record DiscordChannel(string Id, string Name, string Category, ulong LastMessage
 // and embed summaries are folded into Text; their URLs go to Links).
 record DiscordMessage(ulong Id, string Author, DateTimeOffset Timestamp, string Text,
     List<(string Label, string Url)> Links);
+
+// Webex: one space (room). Direct is true for 1:1 conversations, where Title
+// is the other person's name. LastActivity drives the local unread flag.
+record WebexRoom(string Id, string Title, bool Direct, DateTimeOffset LastActivity);
+
+// One Webex message, flattened for terminal display (attachment and card notes
+// are folded into Text). Author is resolved to a display name via the people API.
+record WebexMessage(string Id, string Author, DateTimeOffset Created, string Text);
+
+// One Markdown note in an Obsidian vault. RelPath is vault-relative with
+// forward slashes (the form obsidian:// URIs and wikilinks use).
+record ObsidianNote(string RelPath, string Title, DateTime Modified);
