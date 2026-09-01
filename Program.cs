@@ -57,6 +57,12 @@ const string exitOption = "Exit";
 var menuHeaderTask = FetchMenuHeaderAsync();
 var headerFetchedAt = DateTime.Now;
 
+// Background notification polling (email/texts/Webex/Discord — toggles in
+// Settings > Main menu display; the loop re-reads them every pass, so flipping
+// notify on/off takes effect without a restart). Fire-and-forget: it lives for
+// the session, never touches the console, and dies with the process.
+_ = Task.Run(NotificationPollLoopAsync);
+
 var lastSourceIdx = 0;
 while (true)
 {
@@ -69,8 +75,8 @@ while (true)
     }
 
     var headerLines = new List<string>();
-    if (DisplayOn("clock"))
-        headerLines.Add($"[bold]{DateTime.Now:h:mm tt}[/] [dim]•[/] {DateTime.Now:dddd, MMMM d, yyyy}");
+    if (ClockHeaderLine() is { } clockLine)
+        headerLines.Add(clockLine);
 
     if (await Task.WhenAny(menuHeaderTask, Task.Delay(2500)) == menuHeaderTask
         && await menuHeaderTask is { } headerText)
@@ -84,7 +90,7 @@ while (true)
     // moment it lands (so a slow first fetch doesn't leave the header blank until
     // the next visit); with the clock on, a 60s auto-refresh keeps the time honest.
     var mainIdx = PromptMenu("[green]Pick an option:[/]", mainOptions, 15, backAction: "exit", initialSelected: lastSourceIdx,
-        autoRefresh: DisplayOn("clock") ? TimeSpan.FromSeconds(60) : null,
+        autoRefresh: DisplayOn("clock") || DisplayOn("notify") ? TimeSpan.FromSeconds(60) : null,
         refreshWhen: menuHeaderTask.IsCompleted ? null : () => menuHeaderTask.IsCompleted);
     if (mainIdx <= -2)
     {
@@ -178,8 +184,10 @@ while (true)
     }
 }
 
-// Release the embedded browser / Playwright driver cleanly on exit.
+// Release the embedded browsers / Playwright drivers cleanly on exit.
 await NytBrowser.ShutdownAsync();
+await CloseTextsBrowserAsync();
+TextsBrowser.Driver?.Dispose();
 
 // Games submenu — currently Spelling Bee, room for more NYT-style games later.
 static async Task ShowGamesMenuAsync()
@@ -201,7 +209,7 @@ static async Task ShowGamesMenuAsync()
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Games[/]");
 
         // Connect lives here because the NYT account mainly powers game sync/stats.
@@ -213,7 +221,7 @@ static async Task ShowGamesMenuAsync()
         var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -261,7 +269,7 @@ static Task PlayMazeCrazeAsync()
     finally
     {
         Console.CursorVisible = true;
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     return Task.CompletedTask;
 }
@@ -412,7 +420,7 @@ static Task PlaySnakeAsync()
     finally
     {
         Console.CursorVisible = true;
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     return Task.CompletedTask;
 }
@@ -545,7 +553,7 @@ static Task PlayBreakoutAsync()
     finally
     {
         Console.CursorVisible = true;
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     return Task.CompletedTask;
 }
@@ -760,7 +768,7 @@ static async Task ShowGamesStatsAsync()
         return;
     }
     ShowInPager(content);
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Renders the player.stats blob as one scrollable page, in the games-menu order.
@@ -942,14 +950,14 @@ static async Task ShowGamesArchiveMenuAsync()
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Games archive[/] [dim](previous days)[/]");
 
         var options = new List<string> { wordle, mini, midi, daily, connections, strands, spellingBee, back };
         var idx = PromptMenu("[green]Pick a game:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -1017,7 +1025,7 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]News & newsletters[/]");
 
         var options = new List<string>();
@@ -1029,7 +1037,7 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
         var idx = PromptMenu("[green]Pick a news source:[/]", options, 15, initialSelected: lastIdx);
         if (idx < 0 || options[idx] == back)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -1098,7 +1106,7 @@ static async Task ShowNewsMenuAsync(List<EmailNewsletter> emailNewsletters,
                     var pick = 0;
                     if (feeds.Count > 1)
                     {
-                        AnsiConsole.Clear();
+                        ClearWithHeader();
                         AnsiConsole.MarkupLine($"[bold blue]Feeds found[/] [grey]on {Markup.Escape(feedUrl)}[/]");
                         var feedOptions = feeds.Select(f =>
                             $"{Markup.Escape(f.Title)}  [grey]{Markup.Escape(f.Url)}[/]").ToList();
@@ -1283,7 +1291,7 @@ static async Task<SyndicationFeed> FetchFeedAsync(string url)
 // Renders a plain web page (e.g. a newsletter "view in browser" link) as an article.
 static async Task ShowWebPageAsync(string url)
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
 
     var (title, articleText) = await AnsiConsole.Status()
         .StartAsync("Fetching page...", async _ => await ScrapePageAsync(url));
@@ -1298,7 +1306,7 @@ static async Task ShowWebPageAsync(string url)
     };
 
     ShowInPager(panel, BuildLinks([("This page", url)], articleText));
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Handles the interactive selection and reading UI
@@ -1309,7 +1317,7 @@ static async Task DisplayArticlesAsync(SyndicationFeed feed)
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]{Markup.Escape(feed.Title.Text)}[/]");
 
         var options = articles.Select(a => Markup.Escape(a.Title.Text)).ToList();
@@ -1318,7 +1326,7 @@ static async Task DisplayArticlesAsync(SyndicationFeed feed)
         var idx = PromptMenu("Select an article to read:", options, 10, initialSelected: lastIdx);
         if (idx < 0 || idx == options.Count - 1)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             break;
         }
 
@@ -1577,6 +1585,414 @@ static bool DisplayOn(string key) =>
 static int DisplayNumber(string key, int fallback, int min, int max) =>
     int.TryParse(GetDisplaySetting(key, ""), out var n) ? Math.Clamp(n, min, max) : fallback;
 
+// The persistent header lines (clock, then current conditions) drawn at the top
+// of every screen, not just the main menu. header = off in Settings turns the
+// follow-through off; the clock/weather toggles apply here too. Weather comes
+// from HeaderBar's cached reading — when it goes stale a background refresh is
+// kicked off, so drawing never waits on the network.
+static List<string> PersistentHeaderLines()
+{
+    var lines = new List<string>();
+    if (!DisplayOn("header")) return lines;
+
+    if (ClockHeaderLine() is { } clockLine)
+        lines.Add(clockLine);
+
+    if (DisplayOn("weather"))
+    {
+        if ((HeaderBar.Refresh?.IsCompleted ?? true) && DateTime.Now - HeaderBar.FetchedAt > TimeSpan.FromMinutes(15))
+        {
+            HeaderBar.FetchedAt = DateTime.Now;
+            HeaderBar.Refresh = Task.Run(async () =>
+            {
+                try { HeaderBar.WeatherLine = await FetchCurrentWeatherLineAsync() ?? HeaderBar.WeatherLine; }
+                catch { /* keep the last reading */ }
+            });
+        }
+        if (HeaderBar.WeatherLine is { } weather)
+            lines.Add(weather);
+    }
+    return lines;
+}
+
+// The header's first line: the clock on the left and, when notifications are
+// pending, a count pinned to the right edge (N opens them from any menu or
+// pager). Null when the clock is off and nothing is pending.
+static string? ClockHeaderLine()
+{
+    var clock = DisplayOn("clock")
+        ? $"[bold]{DateTime.Now:h:mm tt}[/] [dim]•[/] {DateTime.Now:dddd, MMMM d, yyyy}"
+        : null;
+    var count = DisplayOn("notify") ? Notify.Count : 0;
+    if (count == 0) return clock;
+
+    var chip = $"[bold yellow]● {count} new[/] [grey]— N to view[/]";
+    if (clock == null) return chip;
+    var pad = Math.Max(2, Console.WindowWidth - 1 - Markup.Remove(clock).Length - Markup.Remove(chip).Length);
+    return clock + new string(' ', pad) + chip;
+}
+
+// Clears the screen and re-draws the persistent header so the time and weather
+// stay visible as the user moves between menus and views. Screens that paint at
+// absolute coordinates (the arcade games) and the main menu (which draws its own
+// richer header) still use AnsiConsole.Clear() directly.
+static void ClearWithHeader()
+{
+    AnsiConsole.Clear();
+    var header = PersistentHeaderLines();
+    if (header.Count > 0)
+        AnsiConsole.MarkupLine(string.Join("\n", header) + "\n");
+}
+
+// ----- Notifications -----------------------------------------------------
+// A background loop polls the configured sources (email, texts, Webex,
+// Discord) and fills Notify; the header shows a count on the clock line, and
+// N opens the center from any menu or pager. Toggles live in Settings > Main
+// menu display: notify (master) and notify-email/-texts/-webex/-discord.
+
+static bool NotifySourceOn(string source) => DisplayOn("notify") && DisplayOn("notify-" + source);
+
+static async Task NotificationPollLoopAsync()
+{
+    // Give the app a moment to draw before the first round of network calls.
+    await Task.Delay(TimeSpan.FromSeconds(3));
+    var lastDiscordPoll = DateTimeOffset.MinValue;
+    while (true)
+    {
+        try
+        {
+            var polls = new List<Task>();
+            if (NotifySourceOn("email")) polls.Add(PollEmailNotificationsAsync());
+            if (NotifySourceOn("webex")) polls.Add(PollWebexNotificationsAsync());
+            if (NotifySourceOn("texts")) polls.Add(PollTextsNotificationsAsync());
+            // One Discord poll boots a full gateway session and downloads the
+            // READY snapshot (megabytes on busy accounts) — cap it at every
+            // 5 minutes no matter what refresh-seconds says.
+            if (NotifySourceOn("discord") && DateTimeOffset.Now - lastDiscordPoll >= TimeSpan.FromMinutes(5))
+            {
+                lastDiscordPoll = DateTimeOffset.Now;
+                polls.Add(PollDiscordNotificationsAsync());
+            }
+            if (polls.Count > 0)
+            {
+                await Task.WhenAll(polls); // each poll catches its own failures
+                Notify.LastPollAt = DateTimeOffset.Now;
+            }
+        }
+        catch (Exception ex) { AppLog.Debug("notify poll", ex); }
+        await Task.Delay(MessagesAutoRefresh() ?? TimeSpan.FromSeconds(60));
+    }
+}
+
+// Unread inbox messages above the account's watermark (the highest UID that was
+// on screen the last time the inbox was viewed) — so mail deliberately left
+// unread doesn't nag, only what arrived since the last look.
+static async Task PollEmailNotificationsAsync()
+{
+    try
+    {
+        var found = new List<AppNotification>();
+        foreach (var (email, appPassword) in LoadGmailAccounts())
+        {
+            using var imap = new ImapClient();
+            await imap.ConnectAsync("imap.gmail.com", 993, SecureSocketOptions.SslOnConnect);
+            await imap.AuthenticateAsync(email, appPassword);
+            await imap.Inbox.OpenAsync(FolderAccess.ReadOnly);
+            var first = Math.Max(0, imap.Inbox.Count - 50);
+            var fetched = imap.Inbox.Count == 0
+                ? []
+                : await imap.Inbox.FetchAsync(first, -1,
+                    MessageSummaryItems.Envelope | MessageSummaryItems.UniqueId | MessageSummaryItems.Flags);
+            await imap.DisconnectAsync(true);
+
+            if (fetched.Count == 0) continue;
+            if (NotifySeen.EmailWatermark(email) == 0)
+            {
+                // First-ever poll for this account: baseline to the current top
+                // so existing unread mail doesn't flood the center.
+                NotifySeen.RaiseEmailWatermark(email, fetched.Max(m => m.UniqueId.Id));
+                continue;
+            }
+            foreach (var m in fetched)
+            {
+                if (m.Flags?.HasFlag(MessageFlags.Seen) ?? false) continue;
+                if (m.UniqueId.Id <= NotifySeen.EmailWatermark(email)) continue;
+                var from = m.Envelope?.From?.Mailboxes?.FirstOrDefault();
+                var who = from?.Name is { Length: > 0 } name ? name : from?.Address ?? "?";
+                found.Add(new AppNotification("Email", $"email:{email}:{m.UniqueId.Id}",
+                    m.Date.ToLocalTime(), who, m.Envelope?.Subject ?? "(no subject)",
+                    TargetId: email, TargetId2: m.UniqueId.Id.ToString()));
+            }
+        }
+        Notify.Update("Email", found);
+        Notify.ClearError("Email");
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("notify email", ex);
+        Notify.SetError("Email", ex.Message);
+    }
+}
+
+// Spaces with activity since this app last showed them — the same local
+// read-markers the Webex section uses (the public API has no read state).
+static async Task PollWebexNotificationsAsync()
+{
+    try
+    {
+        if (WebexApi.Credentials == null || !WebexApi.IsLinked)
+        {
+            Notify.Update("Webex", []);
+            return;
+        }
+        var rooms = await WebexApi.GetRoomsAsync();
+        WebexSeen.BaselineMissing(rooms);
+        Notify.WebexRooms = rooms;
+        Notify.Update("Webex", rooms.Where(WebexUnread).Select(r => new AppNotification("Webex",
+            $"webex:{r.Id}:{r.LastActivity.UtcTicks}", r.LastActivity,
+            r.Title, r.Direct ? "new direct messages" : "new activity in the space",
+            TargetId: r.Id)).ToList());
+        Notify.ClearError("Webex");
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("notify webex", ex);
+        Notify.SetError("Webex", ex.Message);
+    }
+}
+
+// DMs notify on any unread; server channels only on @mentions (matching the
+// official client's red badges — otherwise busy servers would swamp the list).
+static async Task PollDiscordNotificationsAsync()
+{
+    try
+    {
+        if (DiscordApi.Token == null)
+        {
+            Notify.Update("Discord", []);
+            return;
+        }
+        var state = await DiscordApi.FetchStateAsync();
+        Notify.DiscordState = state;
+        var found = new List<AppNotification>();
+        foreach (var guild in state.Guilds)
+            foreach (var ch in guild.Channels)
+            {
+                var isDm = guild.Id.Length == 0;
+                var mentions = state.ReadStates.TryGetValue(ch.Id, out var rs) ? rs.Mentions : 0;
+                if (!(isDm ? DiscordUnread(state, ch) : mentions > 0 && !ch.Muted)) continue;
+                found.Add(new AppNotification("Discord", $"discord:{ch.Id}:{ch.LastMessageId}",
+                    SnowflakeTime(ch.LastMessageId),
+                    isDm ? ch.Name : $"#{ch.Name} — {guild.Name}",
+                    mentions > 0 ? $"@ {mentions} mention{(mentions == 1 ? "" : "s")}" : "new messages",
+                    TargetId: guild.Id, TargetId2: ch.Id));
+            }
+        Notify.Update("Discord", found);
+        Notify.ClearError("Discord");
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("notify discord", ex);
+        Notify.SetError("Discord", ex.Message);
+    }
+}
+
+// A Discord snowflake's embedded timestamp (ms since the 2015 Discord epoch).
+static DateTimeOffset SnowflakeTime(ulong id) =>
+    id == 0 ? DateTimeOffset.Now
+        : DateTimeOffset.FromUnixTimeMilliseconds((long)(id >> 22) + 1420070400000L).ToLocalTime();
+
+// Conversations Google Messages itself flags unread, read from the shared
+// headless page. Skipped while the Texts section drives that page, and never
+// launches a browser before the user has paired at least once.
+static async Task PollTextsNotificationsAsync()
+{
+    if (TextsBrowser.SectionActive || TextsBrowser.PollBroken) return;
+    if (!Directory.Exists(TextsBrowser.ProfileDir)) return;
+
+    if (!await TextsBrowser.Gate.WaitAsync(0)) return; // a poll is already in flight
+    try
+    {
+        if (TextsBrowser.SectionActive) return; // the section grabbed the page meanwhile
+        var page = await EnsureTextsPageAsync();
+        if (!page.Url.StartsWith("https://messages.google.com/web/"))
+        {
+            await page.GotoAsync(TextsBrowser.ConversationsUrl);
+            var el = await page.WaitForSelectorAsync(
+                $"{TextsBrowser.ConvItemSelector}, mw-qr-code, mw-welcome-page-container",
+                new PageWaitForSelectorOptions { Timeout = 45000 });
+            if (await el!.EvaluateAsync<string>("e => e.tagName.toLowerCase()") != TextsBrowser.ConvItemSelector)
+            {
+                // Not paired — stop polling for the session; visiting the Texts
+                // section runs the pairing flow and clears this flag.
+                TextsBrowser.PollBroken = true;
+                Notify.Update("Texts", []);
+                Notify.SetError("Texts", "not paired — open the Texts section to pair");
+                return;
+            }
+        }
+        else
+        {
+            await page.WaitForSelectorAsync(TextsBrowser.ConvItemSelector,
+                new PageWaitForSelectorOptions { Timeout = 30000 });
+        }
+
+        var conversations = await ScrapeConversationsAsync(page);
+        Notify.Update("Texts", conversations.Where(c => c.Unread).Select(c => new AppNotification("Texts",
+            $"texts:{c.Name}:{c.Snippet.GetHashCode()}", DateTimeOffset.Now,
+            c.Name, c.Snippet, TargetId: c.Name)).ToList());
+        Notify.ClearError("Texts");
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("notify texts", ex);
+        Notify.SetError("Texts", ex.Message);
+        await CloseTextsBrowserAsync(); // relaunch fresh on the next poll
+    }
+    finally
+    {
+        TextsBrowser.Gate.Release();
+    }
+}
+
+// The N center: pending notifications newest first. Enter jumps to the item's
+// place in the app, D dismisses it for the session, and the list re-checks
+// itself every 30 seconds while open.
+static async Task ShowNotificationCenterAsync()
+{
+    if (Notify.CenterOpen) return;
+    Notify.CenterOpen = true;
+    try
+    {
+        var lastIdx = 0;
+        while (true)
+        {
+            var items = Notify.Snapshot();
+            ClearWithHeader();
+            var checkedText = Notify.LastPollAt == default
+                ? "first check hasn't finished yet"
+                : $"checked {AgoText(Notify.LastPollAt)} ago";
+            AnsiConsole.MarkupLine($"[bold blue]Notifications[/] [grey]— {checkedText}[/]");
+            foreach (var (source, message) in Notify.ErrorSnapshot())
+                AnsiConsole.MarkupLine($"[yellow]{source}:[/] [grey]{Markup.Escape(message)}[/]");
+            if (items.Count == 0)
+                AnsiConsole.MarkupLine("[grey]Nothing new.[/]");
+
+            var options = items.Select(n =>
+                $"[bold cyan]{n.Source,-7}[/] [bold]{Markup.Escape(n.Title)}[/]  " +
+                $"[grey]{Markup.Escape(n.Detail)}  {AgoText(n.When)}[/]").ToList();
+            options.Add("<= Back");
+
+            var idx = PromptMenu("Open a notification:", options, 15,
+                initialSelected: Math.Min(lastIdx, options.Count - 1),
+                autoRefresh: TimeSpan.FromSeconds(30),
+                action: (ConsoleKey.D, "D dismiss"));
+            if (MenuActioned(idx, ref lastIdx))
+            {
+                if (lastIdx < items.Count) Notify.Dismiss(items[lastIdx].Key);
+                continue;
+            }
+            if (MenuTimedOut(idx, ref lastIdx)) continue; // re-snapshot: the poller may have news
+            if (idx < 0 || idx == options.Count - 1) return;
+            lastIdx = idx;
+            await OpenNotificationAsync(items[idx]);
+        }
+    }
+    finally
+    {
+        Notify.CenterOpen = false;
+    }
+}
+
+// Jumps to where a notification lives: the email itself, or the text/Webex/
+// Discord conversation. Visiting dismisses it here; the section's own
+// read-marking clears the underlying unread state so it doesn't come back.
+static async Task OpenNotificationAsync(AppNotification n)
+{
+    switch (n.Source)
+    {
+        case "Email":
+        {
+            var account = LoadGmailAccounts()
+                .FirstOrDefault(a => a.Email.Equals(n.TargetId, StringComparison.OrdinalIgnoreCase));
+            if (account.Email == null) return; // account removed from Settings
+            await ShowGmailInboxAsync(account, openUid: uint.Parse(n.TargetId2));
+            Notify.Dismiss(n.Key);
+            break;
+        }
+        case "Texts":
+        {
+            if (TextsBrowser.SectionActive)
+            {
+                AnsiConsole.MarkupLine("[yellow]The Texts section is already open below — back out to it to read this.[/]\n");
+                PauseForKey();
+                return;
+            }
+            await OpenTextsConversationAsync(n.TargetId);
+            Notify.Dismiss(n.Key);
+            break;
+        }
+        case "Webex":
+        {
+            var room = Notify.WebexRooms.FirstOrDefault(r => r.Id == n.TargetId);
+            if (room == null) return; // left the space since the poll
+            await ShowWebexRoomAsync(room);
+            Notify.Dismiss(n.Key);
+            break;
+        }
+        case "Discord":
+        {
+            var state = Notify.DiscordState;
+            var guild = state?.Guilds.FirstOrDefault(g => g.Id == n.TargetId);
+            var channel = guild?.Channels.FirstOrDefault(c => c.Id == n.TargetId2);
+            if (state == null || guild == null || channel == null) return;
+            await ShowDiscordChannelAsync(state, guild, channel);
+            Notify.Dismiss(n.Key);
+            break;
+        }
+    }
+}
+
+// Deep link from the notification center straight into one Google Messages
+// conversation, on the same shared browser the Texts section uses.
+static async Task OpenTextsConversationAsync(string name)
+{
+    TextsBrowser.SectionActive = true; // pause polling while we drive the page
+    try
+    {
+        await TextsBrowser.Gate.WaitAsync();
+        TextsBrowser.Gate.Release();
+
+        var conversations = await AnsiConsole.Status().StartAsync("Opening Google Messages...", async _ =>
+        {
+            var page = await EnsureTextsPageAsync();
+            if (!page.Url.StartsWith("https://messages.google.com/web/"))
+                await page.GotoAsync(TextsBrowser.ConversationsUrl);
+            await page.WaitForSelectorAsync(TextsBrowser.ConvItemSelector,
+                new PageWaitForSelectorOptions { Timeout = 45000 });
+            return await ScrapeConversationsAsync(page);
+        });
+
+        var conv = conversations.FirstOrDefault(c => c.Name == name);
+        if (conv == null)
+        {
+            AnsiConsole.MarkupLine("[yellow]That conversation isn't in the list anymore (archived?).[/]\n");
+            PauseForKey();
+            return;
+        }
+        await ShowSmsConversationAsync(TextsBrowser.Page!, conv.Index, conv.Name);
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Text-message error:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+    }
+    finally
+    {
+        TextsBrowser.SectionActive = false;
+    }
+}
+
 // How long the message views (texts, Discord, email) sit idle before they
 // auto-refresh, from the refresh-seconds display setting. Null disables the
 // timer ("off" or 0); anything else is clamped to 10s..1h.
@@ -1655,7 +2071,14 @@ static async Task<string?> FetchMenuHeaderAsync()
     var calendarDeadline = Task.Delay(TimeSpan.FromSeconds(10));
 
     var weather = await weatherTask;
-    if (weather != null) parts.Add(weather);
+    if (weather != null)
+    {
+        parts.Add(weather);
+        // Share the reading with the persistent header so sub-screens show it
+        // immediately instead of firing their own fetch.
+        HeaderBar.WeatherLine = weather;
+        HeaderBar.FetchedAt = DateTime.Now;
+    }
 
     if (await Task.WhenAny(calendarTask, calendarDeadline) == calendarTask)
     {
@@ -1977,7 +2400,7 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
 
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
 
         var (rankName, nextInfo) = BeeRank(score, totalScore);
         var geniusScore = (int)(0.70 * totalScore);
@@ -2120,7 +2543,7 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
                 puzzle.Id, puzzle.PrintDate, found, BeeRank(score, totalScore).Name));
 
     // End-of-session summary, including any pangrams missed.
-    AnsiConsole.Clear();
+    ClearWithHeader();
     var (finalRank, _) = BeeRank(score, totalScore);
     var missedPangrams = puzzle.Pangrams.Where(p => !found.Contains(p)).ToList();
     var sb = new StringBuilder();
@@ -2519,7 +2942,7 @@ static async Task PlayConnectionsAsync(string? archiveDate = null)
 
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Connections[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]" +
             (syncer.Failed ? "   [red](NYT sync failing — reconnect NYT account)[/]" : "") + "\n");
 
@@ -2605,7 +3028,7 @@ static async Task PlayConnectionsAsync(string? archiveDate = null)
             async _ => await NytBrowser.SaveGameStateAsync("connections", puzzle.Id, puzzle.PrintDate,
                 BuildConnectionsGameData(categoryPositions, solved, mistakes)));
 
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Builds Connections game_data matching NYT's shape: solvedCategories (with each
@@ -2772,7 +3195,7 @@ static async Task PlayStrandsAsync(string? archiveDate = null)
 
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Strands[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]" +
             (syncer.Failed ? "   [red](NYT sync failing — reconnect NYT account)[/]" : ""));
         AnsiConsole.MarkupLine($"[italic]Theme: {Markup.Escape(puzzle.Clue)}[/]\n");
@@ -2842,7 +3265,7 @@ static async Task PlayStrandsAsync(string? archiveDate = null)
             async _ => await NytBrowser.SaveGameStateAsync("strands", puzzle.Id, puzzle.PrintDate,
                 BuildStrandsGameData(puzzle, found, otherWords, allWords.Count)));
 
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Builds Strands game_data matching NYT's shape: history of THEME/SPANGRAM finds,
@@ -2977,7 +3400,7 @@ static async Task PlayCrosswordAsync(string publishType, string title, string? a
 
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         RenderCrossword(puzzle, entry, cur, across);
 
         var done = Enumerable.Range(0, puzzle.Cells.Length)
@@ -3027,7 +3450,7 @@ static async Task PlayCrosswordAsync(string publishType, string title, string? a
         }
     }
 
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Renders the grid (cursor cell highlighted, current word tinted) plus the active clue.
@@ -3341,7 +3764,7 @@ static async Task PlayWordleAsync(string? archiveDate = null)
 
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Wordle[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]{syncNote}\n");
 
         // Board: 6 rows of 5 tiles.
@@ -3401,7 +3824,7 @@ static async Task PlayWordleAsync(string? archiveDate = null)
         await AnsiConsole.Status().StartAsync("Saving progress to your NYT account...",
             async _ => await NytBrowser.SaveWordleStateAsync(puzzle.Id, puzzle.PrintDate, guesses, status));
 
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Per-letter feedback with Wordle's duplicate-letter rules: greens first, then
@@ -3665,7 +4088,7 @@ static async Task ShowSubredditAsync(string subreddit)
         var scoresKnown = posts.Count == 0 || posts[0].Score >= 0;
         var visible = scoresKnown ? posts.Where(p => p.Score >= minUpvotes).ToList() : posts;
 
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             $"[bold blue]r/{Markup.Escape(subreddit)}[/] [grey]— {sortName}" +
             (scoresKnown && minUpvotes > 0 ? $", {minUpvotes}+ upvotes ({visible.Count} of {posts.Count} shown)" : "") + "[/]");
@@ -3691,7 +4114,7 @@ static async Task ShowSubredditAsync(string subreddit)
 
         if (idx < 0 || options[idx] == back)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -3991,7 +4414,7 @@ static async Task ReadRedditPostAsync(string subreddit, RedditPost post)
 
 static async Task ReadArticleAsync(SyndicationItem article)
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
     var url = article.Links.FirstOrDefault()?.Uri?.ToString();
 
     if (string.IsNullOrEmpty(url))
@@ -4188,7 +4611,8 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
 
         var more = (top > 0 ? "▲ more above  " : "") + (top + pageSize < items.Count ? "▼ more below" : "");
         WriteLine(more.Length > 0 ? $"[grey]{more}[/]" : "");
-        WriteLine($"[grey]Up/Down move • Enter/→ select{(action is { } ah ? $" • {ah.Hint}" : "")} • ←/Esc/Backspace/Q {backAction}[/]");
+        WriteLine($"[grey]Up/Down move • Enter/→ select{(action is { } ah ? $" • {ah.Hint}" : "")}" +
+                  $"{(Notify.Count > 0 && !Notify.CenterOpen ? " • N notifications" : "")} • ←/Esc/Backspace/Q {backAction}[/]");
 
         if (autoRefresh != null || refreshWhen != null)
         {
@@ -4224,6 +4648,17 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
             case ConsoleKey.Enter or ConsoleKey.RightArrow:
                 Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
                 return selected;
+            case ConsoleKey.N when DisplayOn("notify") && !Notify.CenterOpen:
+                Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
+                ShowNotificationCenterAsync().GetAwaiter().GetResult();
+                // Callers with a refresh path get the timeout sentinel (they
+                // redraw their chrome and refetch); the rest redraw the frame
+                // in place under a fresh header.
+                if (autoRefresh != null || refreshWhen != null) return -2 - selected;
+                ClearWithHeader();
+                Console.Write(new string('\n', frameHeight));
+                startTop = Math.Max(0, Console.CursorTop - frameHeight);
+                break;
             case ConsoleKey.Escape or ConsoleKey.Backspace or ConsoleKey.Q or ConsoleKey.LeftArrow:
                 Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
                 return -1;
@@ -4286,11 +4721,17 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
     if (startAtLine is { } sl) offset = sl;
     while (true)
     {
-        var height = Math.Max(1, Console.WindowHeight - 1); // bottom row holds the key hints
+        // The persistent header sits above the content (plus a blank separator),
+        // so the scroll viewport shrinks by that much.
+        var header = PersistentHeaderLines();
+        var headerHeight = header.Count > 0 ? header.Count + 1 : 0;
+        var height = Math.Max(1, Console.WindowHeight - 1 - headerHeight); // bottom row holds the key hints
         var maxOffset = Math.Max(0, lines.Count - height);
         offset = Math.Clamp(offset, 0, maxOffset);
 
         AnsiConsole.Clear();
+        if (header.Count > 0)
+            AnsiConsole.MarkupLine(string.Join("\n", header) + "\n");
         var sb = new StringBuilder();
         for (var i = offset; i < Math.Min(offset + height, lines.Count); i++)
             sb.Append(lines[i]).Append('\n');
@@ -4306,7 +4747,8 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
             : "";
         var extraHint = actions is { Length: > 0 } ? ", " + string.Join(", ", actions.Select(a => a.Hint)) : "";
         var olderHint = loadMoreAtTop && offset == 0 ? " (↑ loads older)" : "";
-        AnsiConsole.Markup($"[grey]{position}{olderHint} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}, ←/Esc/Backspace/Q back[/]");
+        var notifyHint = Notify.Count > 0 && !Notify.CenterOpen ? ", N notifications" : "";
+        AnsiConsole.Markup($"[grey]{position}{olderHint} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}{notifyHint}, ←/Esc/Backspace/Q back[/]");
 
         if (autoRefresh is { } interval)
         {
@@ -4317,7 +4759,7 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
             {
                 if (DateTime.UtcNow >= deadline && offset == maxOffset)
                 {
-                    AnsiConsole.Clear();
+                    ClearWithHeader();
                     return ConsoleKey.F5;
                 }
                 Thread.Sleep(100);
@@ -4327,13 +4769,13 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
         var key = Console.ReadKey(intercept: true);
         if (actions != null && actions.Any(a => a.Key == key.Key))
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return key.Key;
         }
         switch (key.Key)
         {
             case ConsoleKey.UpArrow or ConsoleKey.K or ConsoleKey.PageUp when offset == 0 && loadMoreAtTop:
-                AnsiConsole.Clear();
+                ClearWithHeader();
                 return ConsoleKey.F6;
             case ConsoleKey.UpArrow or ConsoleKey.K: offset--; break;
             case ConsoleKey.DownArrow or ConsoleKey.J: offset++; break;
@@ -4348,7 +4790,7 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
                 }
                 else
                 {
-                    AnsiConsole.Clear();
+                    ClearWithHeader();
                     var linkOptions = links.Select(l =>
                     {
                         var host = Uri.TryCreate(l.Url, UriKind.Absolute, out var u) ? u.Host : "";
@@ -4361,8 +4803,11 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
                     if (pick >= 0) Open(links[pick].Url);
                 }
                 break;
+            case ConsoleKey.N when DisplayOn("notify") && !Notify.CenterOpen:
+                ShowNotificationCenterAsync().GetAwaiter().GetResult();
+                break; // the loop repaints the header and content in full
             case ConsoleKey.Enter or ConsoleKey.Escape or ConsoleKey.Q or ConsoleKey.Backspace or ConsoleKey.LeftArrow:
-                AnsiConsole.Clear();
+                ClearWithHeader();
                 return null;
         }
     }
@@ -4565,7 +5010,7 @@ static async Task ShowNewsletterFromGmailAsync(EmailNewsletter newsletter)
         var lastIdx = 0;
         while (true)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             AnsiConsole.MarkupLine($"[bold blue]{Markup.Escape(newsletter.Label)}[/]");
 
             var options = summaries.Items
@@ -4601,7 +5046,7 @@ static async Task ShowNewsletterFromGmailAsync(EmailNewsletter newsletter)
         }
 
         await imap.DisconnectAsync(true);
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     catch (AuthenticationException)
     {
@@ -4813,7 +5258,7 @@ static async Task ShowUnreadEmailAsync()
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Email[/] [grey]— multiple accounts configured[/]");
         var options = accounts.Select(a => Markup.Escape(a.Email)).ToList();
         options.Add("<= Back to Main Menu");
@@ -4821,7 +5266,7 @@ static async Task ShowUnreadEmailAsync()
         var idx = PromptMenu("Pick an inbox:", options, 15, initialSelected: lastIdx);
         if (idx < 0 || idx == options.Count - 1)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -4829,8 +5274,9 @@ static async Task ShowUnreadEmailAsync()
     }
 }
 
-// The inbox reader for one Gmail account.
-static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
+// The inbox reader for one Gmail account. openUid (from the notification
+// center) opens that message immediately, then falls through to the list.
+static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds, uint? openUid = null)
 {
     try
     {
@@ -4858,6 +5304,14 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
                 : await imap.Inbox.FetchAsync(first, -1,
                     MessageSummaryItems.Envelope | MessageSummaryItems.UniqueId | MessageSummaryItems.Flags);
             starToggled.Clear();
+
+            // Seeing the list is the "last look" that baselines email
+            // notifications: nothing on screen now will notify again.
+            if (fetched.Count > 0)
+                NotifySeen.RaiseEmailWatermark(creds.Email, fetched.Max(m => m.UniqueId.Id));
+            Notify.Drop(n => n.Source == "Email" &&
+                             n.TargetId.Equals(creds.Email, StringComparison.OrdinalIgnoreCase));
+
             return fetched.OrderByDescending(m => m.Date).ToList();
         }
 
@@ -4909,10 +5363,23 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
             PauseForKey();
         }
 
+        // Deep link from the notification center: open the message right away,
+        // then fall through to the normal list.
+        if (openUid is { } uid)
+        {
+            if (messages.FirstOrDefault(m => m.UniqueId.Id == uid) is { } target)
+                await ViewMessageAsync(target);
+            else
+            {
+                AnsiConsole.MarkupLine("[yellow]That message is no longer in the inbox (read or archived elsewhere?).[/]\n");
+                PauseForKey();
+            }
+        }
+
         var lastIdx = 0;
         while (true)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             var unreadCount = messages.Count(m => IsUnread(m) && !readNow.Contains(m.UniqueId.Id));
             AnsiConsole.MarkupLine(
                 $"[bold blue]Email inbox[/] [grey]— {Markup.Escape(creds.Email)} — {messages.Count} recent message(s), " +
@@ -4968,7 +5435,14 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
                 continue;
             }
 
-            var summary = messages[idx];
+            await ViewMessageAsync(messages[idx]);
+        }
+
+        // Downloads and shows one message (marking it read), with reply, star,
+        // and archive available from the pager. Shared by the list above and
+        // the notification center's deep link.
+        async Task ViewMessageAsync(IMessageSummary summary)
+        {
             var message = await AnsiConsole.Status().StartAsync("Downloading message...", async _ =>
             {
                 var msg = await imap.Inbox.GetMessageAsync(summary.UniqueId);
@@ -5061,7 +5535,7 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
         }
 
         if (imap.IsConnected) await imap.DisconnectAsync(true);
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     catch (AuthenticationException)
     {
@@ -5112,7 +5586,7 @@ static async Task SendGmailAsync((string Email, string AppPassword) creds, MimeM
 // explicit confirmation before anything is sent.
 static async Task ComposeEmailAsync((string Email, string AppPassword) creds)
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
     AnsiConsole.MarkupLine("[bold blue]Compose[/] [grey]— sent from " + Markup.Escape(creds.Email) + "[/]\n");
 
     AnsiConsole.Markup("[green]To[/] [grey](one or more addresses, comma-separated; blank cancels):[/] ");
@@ -5148,7 +5622,7 @@ static async Task ComposeEmailAsync((string Email, string AppPassword) creds)
 // before sending.
 static async Task ReplyToEmailAsync((string Email, string AppPassword) creds, MimeMessage original)
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
     var to = original.ReplyTo.Count > 0 ? original.ReplyTo : original.From;
     AnsiConsole.MarkupLine($"[bold blue]Reply[/] [grey]— to {Markup.Escape(to.ToString())}[/]\n");
 
@@ -5236,19 +5710,20 @@ static async Task<string?> TryFetchNewsletterTextFromGmailAsync(
 // 'gmessages-profile' folder next to the app, so later runs are invisible.
 static async Task ShowTextMessagesAsync()
 {
-    var profileDir = Path.Combine(AppContext.BaseDirectory, "gmessages-profile");
-    const string conversationsUrl = "https://messages.google.com/web/conversations";
-    const string convItemSelector = "mws-conversation-list-item";
+    var profileDir = TextsBrowser.ProfileDir;
+    const string conversationsUrl = TextsBrowser.ConversationsUrl;
+    const string convItemSelector = TextsBrowser.ConvItemSelector;
 
-    IPlaywright? playwright = null;
     IPage? page = null;
+    TextsBrowser.SectionActive = true; // the notification poller keeps its hands off while we drive
     try
     {
-        playwright = await Playwright.CreateAsync();
+        // Let any in-flight background poll finish before taking the wheel.
+        await TextsBrowser.Gate.WaitAsync();
+        TextsBrowser.Gate.Release();
 
-        var context = await AnsiConsole.Status().StartAsync("Starting embedded browser...",
-            async _ => await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true));
-        page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+        page = await AnsiConsole.Status().StartAsync("Starting embedded browser...",
+            async _ => await EnsureTextsPageAsync());
 
         // A fresh profile lands on a welcome page; an unpaired-but-visited one lands on
         // the QR page; a paired one goes straight to the conversation list.
@@ -5267,7 +5742,7 @@ static async Task ShowTextMessagesAsync()
             // browser with an automation debugger attached (silent sign-in loop), so
             // launch plain Chrome on the same profile with no automation at all.
             // Reading the paired session afterwards with automation is fine.
-            await context.DisposeAsync();
+            await CloseTextsBrowserAsync();
             AnsiConsole.MarkupLine(
                 "[yellow]This computer isn't paired with your phone yet.[/]\n" +
                 "[grey]A regular Chrome window will open (no automation, so Google sign-in works).\n" +
@@ -5286,14 +5761,13 @@ static async Task ShowTextMessagesAsync()
             AnsiConsole.MarkupLine("[grey]Waiting for you to pair and close the browser window...[/]");
             if (pairingProc != null) await pairingProc.WaitForExitAsync();
 
-            context = await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true);
-            page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            page = await EnsureTextsPageAsync();
             await page.GotoAsync(conversationsUrl);
             await page.WaitForSelectorAsync(convItemSelector,
                 new PageWaitForSelectorOptions { Timeout = 60000 });
+            TextsBrowser.PollBroken = false; // pairing repaired — polling can resume
         }
 
-        try
         {
             var lastIdx = 0;
             const string refresh = "== Refresh ==";
@@ -5310,7 +5784,7 @@ static async Task ShowTextMessagesAsync()
                         return await ScrapeConversationsAsync(page);
                     });
 
-                AnsiConsole.Clear();
+                ClearWithHeader();
                 AnsiConsole.MarkupLine("[bold blue]Text messages[/] [grey]— Google Messages[/]");
                 if (conversations.Count == 0)
                     AnsiConsole.MarkupLine("[yellow]No conversations found — the page layout may have changed.[/]");
@@ -5372,11 +5846,7 @@ static async Task ShowTextMessagesAsync()
                 // re-scrapes it (reflecting any sent reply or archive) instantly.
             }
         }
-        finally
-        {
-            await context.DisposeAsync();
-        }
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     catch (PlaywrightException ex)
     {
@@ -5385,6 +5855,8 @@ static async Task ShowTextMessagesAsync()
             "[grey]If pairing broke or the page changed, delete the 'gmessages-profile' folder " +
             "next to the app and pair again.[/]\n");
         await DumpPageDiagnosticsAsync(page, "gmessages");
+        // A broken browser shouldn't linger for the poller — relaunch fresh next time.
+        await CloseTextsBrowserAsync();
         PauseForKey();
     }
     catch (Exception ex)
@@ -5395,7 +5867,9 @@ static async Task ShowTextMessagesAsync()
     }
     finally
     {
-        playwright?.Dispose();
+        // The shared browser stays up for background notification polling; it
+        // closes with the app (or above, after a browser-level failure).
+        TextsBrowser.SectionActive = false;
     }
 }
 
@@ -5444,6 +5918,29 @@ static string FindBrowserExe()
     ];
     return candidates.FirstOrDefault(File.Exists)
         ?? throw new InvalidOperationException("Neither Chrome nor Edge was found on this machine.");
+}
+
+// The shared headless Google Messages page (see TextsBrowser). Launches on
+// first use and then stays up for the session so the notification poller can
+// keep watching for new texts without relaunching Chrome every minute.
+static async Task<IPage> EnsureTextsPageAsync()
+{
+    if (TextsBrowser.Page is { IsClosed: false } page) return page;
+    TextsBrowser.Driver ??= await Playwright.CreateAsync();
+    TextsBrowser.Context = await LaunchMessagesBrowserAsync(TextsBrowser.Driver, TextsBrowser.ProfileDir, headless: true);
+    TextsBrowser.Page = TextsBrowser.Context.Pages.FirstOrDefault() ?? await TextsBrowser.Context.NewPageAsync();
+    return TextsBrowser.Page;
+}
+
+// Releases the profile dir (for the pairing flow's plain-Chrome window, after a
+// browser-level failure, and at app exit). The Playwright driver survives so a
+// relaunch is cheap; it's disposed with the final shutdown.
+static async Task CloseTextsBrowserAsync()
+{
+    try { if (TextsBrowser.Context != null) await TextsBrowser.Context.DisposeAsync(); }
+    catch (Exception ex) { AppLog.Debug("texts browser close", ex); }
+    TextsBrowser.Context = null;
+    TextsBrowser.Page = null;
 }
 
 static async Task<IBrowserContext> LaunchMessagesBrowserAsync(IPlaywright playwright, string profileDir, bool headless)
@@ -6122,7 +6619,7 @@ static void ShowSettings()
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Settings[/] [grey]— stored in config.txt next to the app[/]");
 
         var options = Config.Sections.Select(s =>
@@ -6138,7 +6635,7 @@ static void ShowSettings()
         var idx = PromptMenu("Pick a setting:", options, 15, initialSelected: lastIdx);
         if (idx < 0 || idx == options.Count - 1)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             return;
         }
         lastIdx = idx;
@@ -6168,7 +6665,7 @@ static void EditConfigSection(Config.Section section)
 {
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]{Markup.Escape(section.Title)}[/] [grey]— [[{section.Name}]] in config.txt[/]");
         foreach (var h in section.Help)
             AnsiConsole.MarkupLine($"[grey]{Markup.Escape(h)}[/]");
@@ -6455,7 +6952,7 @@ static async Task ShowGeminiAsync()
                 var conversations = await AnsiConsole.Status().StartAsync("Loading conversations...",
                     async _ => await ScrapeGeminiConversationsAsync(page!));
 
-                AnsiConsole.Clear();
+                ClearWithHeader();
                 AnsiConsole.MarkupLine("[bold blue]Gemini[/] [grey]— gemini.google.com[/]");
                 if (conversations.Count == 0)
                     AnsiConsole.MarkupLine(
@@ -6562,7 +7059,7 @@ static async Task ShowGeminiAsync()
         {
             await context.DisposeAsync();
         }
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     catch (Exception ex)
     {
@@ -6850,7 +7347,7 @@ static async Task ShowGeminiApiChatsAsync()
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Gemini[/] [grey]— local API chats ({Markup.Escape(GeminiApi.Model)})[/]");
 
         var chats = GeminiChat.LoadAll();
@@ -6873,7 +7370,7 @@ static async Task ShowGeminiApiChatsAsync()
 
         if (options[idx] == deleteChat)
         {
-            AnsiConsole.Clear();
+            ClearWithHeader();
             AnsiConsole.MarkupLine("[bold blue]Gemini[/] [grey]— delete a conversation[/]");
             var delOptions = chats.Select(c =>
                 $"{Markup.Escape(c.Title)}  [grey]{c.Updated:MMM d, h:mm tt}[/]").ToList();
@@ -6885,7 +7382,7 @@ static async Task ShowGeminiApiChatsAsync()
 
         await ShowGeminiChatAsync(chats[idx - 1]); // options[0] is newChat
     }
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // One conversation in the pager, oldest first; R composes the next message.
@@ -6951,7 +7448,7 @@ static async Task ShowDiscordAsync()
 {
     if (DiscordApi.Token == null)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             "[yellow]No Discord token configured.[/]\n\n" +
             "[grey]Add your user token under Settings > Discord (instructions are shown there).\n" +
@@ -6969,7 +7466,7 @@ static async Task ShowDiscordAsync()
     const string refresh = "== Refresh ==";
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Discord[/] [grey]— servers[/]");
 
         var options = state.Guilds.Select(g =>
@@ -7001,7 +7498,7 @@ static async Task ShowDiscordAsync()
         lastIdx = idx;
         state = await ShowDiscordChannelsAsync(state, state.Guilds[idx]);
     }
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // One gateway snapshot fetch behind a spinner; shows the error and returns
@@ -7031,7 +7528,7 @@ static async Task<DiscordState> ShowDiscordChannelsAsync(DiscordState state, Dis
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]{Markup.Escape(guild.Name)}[/] [grey]— channels[/]");
         if (guild.Channels.Count == 0)
             AnsiConsole.MarkupLine("[yellow]No text channels visible here.[/]");
@@ -7206,7 +7703,7 @@ static async Task ShowWebexAsync()
 {
     if (WebexApi.Credentials == null)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             "[yellow]Webex isn't set up yet.[/]\n\n" +
             "[grey]Create a free integration at developer.webex.com/my-apps and add its\n" +
@@ -7224,7 +7721,7 @@ static async Task ShowWebexAsync()
     const string refresh = "== Refresh ==";
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Webex[/] [grey]— spaces[/]");
 
         var options = rooms.Select(r =>
@@ -7255,7 +7752,7 @@ static async Task ShowWebexAsync()
         lastIdx = idx;
         await ShowWebexRoomAsync(rooms[idx]);
     }
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // A space counts as unread when it has activity newer than the last time this
@@ -7279,7 +7776,7 @@ static string AgoText(DateTimeOffset t)
 // browser still lands on localhost with the code in the address bar.
 static async Task<bool> LinkWebexAsync()
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
     AnsiConsole.MarkupLine("[bold blue]Webex[/] [grey]— one-time sign-in[/]\n");
 
     var state = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
@@ -7481,7 +7978,7 @@ static void ShowObsidian()
     var vaults = ObsidianVault.GetVaults();
     if (vaults.Count == 0)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             "[yellow]No Obsidian vault found.[/]\n\n" +
             "[grey]No vaults are registered in Obsidian's settings and none are configured\n" +
@@ -7494,7 +7991,7 @@ static void ShowObsidian()
     var vault = vaults[0];
     if (vaults.Count > 1)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Obsidian[/] [grey]— vaults[/]");
         var pick = PromptMenu("Select a vault:",
             vaults.Select(v => $"[bold]{Markup.Escape(v.Name)}[/]  [grey]{Markup.Escape(v.Root)}[/]").ToList());
@@ -7520,7 +8017,7 @@ static void ShowObsidian()
             return;
         }
 
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Obsidian[/] [grey]— {Markup.Escape(vault.Name)}[/]");
 
         var options = new List<string> { daily, search, browse };
@@ -7541,7 +8038,7 @@ static void ShowObsidian()
         else if (options[idx] == browse) ShowObsidianFolder(vault, "");
         else ShowObsidianNote(vault, recent[idx - 3]);
     }
-    AnsiConsole.Clear();
+    ClearWithHeader();
 }
 
 // Folder browser, one level per call (going back pops naturally up the stack).
@@ -7562,7 +8059,7 @@ static void ShowObsidianFolder(ObsidianVault.Vault vault, string relDir)
             return;
         }
 
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             $"[bold blue]Obsidian[/] [grey]— {Markup.Escape(relDir.Length == 0 ? vault.Name : relDir)}[/]");
         if (listing.Folders.Count == 0 && listing.Notes.Count == 0)
@@ -7585,7 +8082,7 @@ static void ShowObsidianFolder(ObsidianVault.Vault vault, string relDir)
 
 static void ShowObsidianSearch(ObsidianVault.Vault vault)
 {
-    AnsiConsole.Clear();
+    ClearWithHeader();
     var query = PromptReplyLine("[green]Search notes for[/] [grey](leave blank to cancel):[/]");
     if (query.Length == 0) return;
 
@@ -7600,7 +8097,7 @@ static void ShowObsidianSearch(ObsidianVault.Vault vault)
     var lastIdx = 0;
     while (true)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             $"[bold blue]Obsidian[/] [grey]— {hits.Count} match{(hits.Count == 1 ? "" : "es")} for \"{Markup.Escape(query)}\"[/]");
 
@@ -7808,7 +8305,7 @@ static async Task ShowTimeClockAsync()
     var useForm = username != null && password != null;
     if (company == null)
     {
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine(
             "[yellow]The time clock needs your Paylocity company ID.[/]\n\n" +
             "[grey]Paylocity ends its web session the moment the browser closes, so the app\n" +
@@ -7938,7 +8435,7 @@ static async Task ShowTimeClockAsync()
         });
 
         await ShowTimeClockMenuAsync(page);
-        AnsiConsole.Clear();
+        ClearWithHeader();
     }
     catch (PlaywrightException ex)
     {
@@ -8106,7 +8603,7 @@ static async Task ShowTimeClockMenuAsync(IPage page)
                 continue;
         }
 
-        AnsiConsole.Clear();
+        ClearWithHeader();
         AnsiConsole.MarkupLine("[bold blue]Time clock[/] [grey]— Paylocity[/]");
         WriteTimeClockStatus(tile, body);
         if (buttons.Count == 0)

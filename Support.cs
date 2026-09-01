@@ -57,6 +57,17 @@ static class Paths
     }
 }
 
+// Shared state for the persistent header (clock + current conditions) that
+// follows the user through every menu and view, not just the main menu.
+// Program.cs's PersistentHeaderLines composes the lines; this just holds the
+// last weather reading so sub-screens never wait on the network to draw.
+static class HeaderBar
+{
+    public static string? WeatherLine;      // last fetched conditions markup
+    public static DateTime FetchedAt;       // when WeatherLine was last refreshed
+    public static Task? Refresh;            // in-flight background refresh, if any
+}
+
 // Opt-in debug log. Off by default; enable by setting the DAILYSHELL_DEBUG=1
 // environment variable or creating a data/debug.on file. Keeps diagnostics
 // available without cluttering normal runs.
