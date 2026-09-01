@@ -47,6 +47,7 @@ const string discordOption = "Discord";
 const string webexOption = "Webex";
 const string geminiOption = "Gemini";
 const string obsidianOption = "Obsidian notes";
+const string timeclockOption = "Time clock";
 const string gamesOption = "Games";
 const string settingsOption = "Settings";
 const string exitOption = "Exit";
@@ -77,7 +78,7 @@ while (true)
     if (headerLines.Count > 0)
         AnsiConsole.MarkupLine(string.Join("\n", headerLines) + "\n");
 
-    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, webexOption, geminiOption, obsidianOption, gamesOption, settingsOption, exitOption };
+    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, webexOption, geminiOption, obsidianOption, timeclockOption, gamesOption, settingsOption, exitOption };
 
     // While the header fetch is still running, refreshWhen redraws the menu the
     // moment it lands (so a slow first fetch doesn't leave the header blank until
@@ -147,6 +148,12 @@ while (true)
     if (choice == obsidianOption)
     {
         ShowObsidian();
+        continue;
+    }
+
+    if (choice == timeclockOption)
+    {
+        await ShowTimeClockAsync();
         continue;
     }
 
@@ -4133,8 +4140,10 @@ static string ExtractReadableText(HtmlDocument doc)
 // user presses Esc, Backspace, or Q. Items may contain Spectre markup. Draws in
 // place below the current cursor so headers/messages above it stay visible.
 // With autoRefresh set, returns -2 - selected after that much idle time so the
-// caller can rebuild the list; MenuTimedOut decodes that signal.
-static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0, TimeSpan? autoRefresh = null, Func<bool>? refreshWhen = null)
+// caller can rebuild the list; MenuTimedOut decodes that signal. With action
+// set, pressing that key returns -1000 - selected (MenuActioned decodes it) so
+// the caller can act on the highlighted item without entering it.
+static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0, TimeSpan? autoRefresh = null, Func<bool>? refreshWhen = null, (ConsoleKey Key, string Hint)? action = null)
 {
     pageSize = Math.Clamp(Math.Min(pageSize, items.Count), 1, Math.Max(1, Console.WindowHeight - 5));
     var frameHeight = pageSize + 3; // title + items + more-indicator + key hints
@@ -4179,7 +4188,7 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
 
         var more = (top > 0 ? "▲ more above  " : "") + (top + pageSize < items.Count ? "▼ more below" : "");
         WriteLine(more.Length > 0 ? $"[grey]{more}[/]" : "");
-        WriteLine($"[grey]Up/Down move • Enter/→ select • ←/Esc/Backspace/Q {backAction}[/]");
+        WriteLine($"[grey]Up/Down move • Enter/→ select{(action is { } ah ? $" • {ah.Hint}" : "")} • ←/Esc/Backspace/Q {backAction}[/]");
 
         if (autoRefresh != null || refreshWhen != null)
         {
@@ -4199,6 +4208,11 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
         }
 
         var key = Console.ReadKey(intercept: true);
+        if (action is { } act && key.Key == act.Key)
+        {
+            Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
+            return -1000 - selected;
+        }
         switch (key.Key)
         {
             case ConsoleKey.UpArrow or ConsoleKey.K: selected = (selected - 1 + items.Count) % items.Count; break;
@@ -4219,10 +4233,20 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
 
 // True when PromptMenu returned its idle auto-refresh signal (-2 - selected);
 // restores the cursor position into selected so the rebuilt menu reopens there.
+// (The action signal starts at -1000, well below any real selected index.)
 static bool MenuTimedOut(int idx, ref int selected)
 {
-    if (idx > -2) return false;
+    if (idx > -2 || idx <= -1000) return false;
     selected = -2 - idx;
+    return true;
+}
+
+// True when PromptMenu returned its action-key signal (-1000 - selected);
+// restores the highlighted index into selected so the caller knows the target.
+static bool MenuActioned(int idx, ref int selected)
+{
+    if (idx > -1000) return false;
+    selected = -1000 - idx;
     return true;
 }
 
@@ -4812,6 +4836,11 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
     {
         using var imap = new ImapClient();
 
+        // Uids whose \Flagged (Gmail star) state was flipped this session; the
+        // server state XOR this gives the current star. Cleared on refetch,
+        // when the summaries carry the up-to-date flags again.
+        var starToggled = new HashSet<uint>();
+
         async Task<List<IMessageSummary>> FetchInboxAsync()
         {
             if (!imap.IsConnected)
@@ -4828,12 +4857,57 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
                 ? []
                 : await imap.Inbox.FetchAsync(first, -1,
                     MessageSummaryItems.Envelope | MessageSummaryItems.UniqueId | MessageSummaryItems.Flags);
+            starToggled.Clear();
             return fetched.OrderByDescending(m => m.Date).ToList();
         }
+
+        bool IsStarred(IMessageSummary m) =>
+            (m.Flags?.HasFlag(MessageFlags.Flagged) ?? false) ^ starToggled.Contains(m.UniqueId.Id);
 
         var messages = await AnsiConsole.Status().StartAsync("Loading inbox...",
             async _ => await FetchInboxAsync());
         var readNow = new HashSet<uint>(); // uids marked \Seen in this session
+
+        // Confirm-and-archive, shared by the list's A key and the message view.
+        // Archive = move out of Inbox into All Mail, exactly what Gmail's own
+        // Archive button does; the message stays findable in All Mail. An
+        // unread message is marked read first so it doesn't sit unread there.
+        // On success the message leaves the local list; declining or failing
+        // leaves everything unchanged.
+        async Task ArchiveEmailAsync(IMessageSummary target)
+        {
+            var subjectLabel = target.Envelope?.Subject ?? "(no subject)";
+            if (!AnsiConsole.Confirm($"Archive \"{Markup.Escape(subjectLabel)}\"?", defaultValue: true))
+                return;
+
+            var archived = await AnsiConsole.Status().StartAsync("Archiving...", async _ =>
+            {
+                try
+                {
+                    if (IsUnread(target) && !readNow.Contains(target.UniqueId.Id))
+                    {
+                        await imap.Inbox.AddFlagsAsync(target.UniqueId, MessageFlags.Seen, silent: true);
+                        readNow.Add(target.UniqueId.Id);
+                    }
+                    var allMail = imap.GetFolder(SpecialFolder.All);
+                    if (allMail == null) return false;
+                    await imap.Inbox.MoveToAsync(target.UniqueId, allMail);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Debug("archive email", ex);
+                    return false;
+                }
+            });
+            if (archived)
+            {
+                messages.Remove(target);
+                return;
+            }
+            AnsiConsole.MarkupLine("[red]Could not archive — the message is unchanged.[/]\n");
+            PauseForKey();
+        }
 
         var lastIdx = 0;
         while (true)
@@ -4851,7 +4925,8 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
                 var from = m.Envelope?.From?.Mailboxes?.FirstOrDefault();
                 var who = from?.Name is { Length: > 0 } name ? name : from?.Address ?? "?";
                 var dot = IsUnread(m) && !readNow.Contains(m.UniqueId.Id) ? "[bold cyan]●[/] " : "  ";
-                return $"{dot}[bold]{m.Date.ToLocalTime():MM/dd HH:mm}[/]  {Markup.Escape(who)}  " +
+                var star = IsStarred(m) ? "[yellow]★[/] " : "  ";
+                return $"{dot}{star}[bold]{m.Date.ToLocalTime():MM/dd HH:mm}[/]  {Markup.Escape(who)}  " +
                        $"[grey]{Markup.Escape(m.Envelope?.Subject ?? "(no subject)")}[/]";
             }).ToList();
             options.Add(compose);
@@ -4859,7 +4934,13 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
             options.Add("<= Back to Main Menu");
 
             var idx = PromptMenu("Select a message:", options, 15, initialSelected: lastIdx,
-                autoRefresh: MessagesAutoRefresh());
+                autoRefresh: MessagesAutoRefresh(), action: (ConsoleKey.A, "A archive"));
+            if (MenuActioned(idx, ref lastIdx))
+            {
+                if (lastIdx < messages.Count) // not the compose/refresh/back rows
+                    await ArchiveEmailAsync(messages[lastIdx]);
+                continue;
+            }
             if (MenuTimedOut(idx, ref lastIdx))
             {
                 // Keep the current list if the background refresh hiccups (e.g.
@@ -4925,7 +5006,12 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
             while (true)
             {
                 var action = ShowInPager(panel, links,
-                    actions: [(ConsoleKey.R, "R reply"), (ConsoleKey.A, "A archive")]);
+                    actions:
+                    [
+                        (ConsoleKey.R, "R reply"),
+                        (ConsoleKey.S, IsStarred(summary) ? "S unstar" : "S star"),
+                        (ConsoleKey.A, "A archive"),
+                    ]);
                 if (action == null) break;
 
                 if (action == ConsoleKey.R)
@@ -4934,34 +5020,43 @@ static async Task ShowGmailInboxAsync((string Email, string AppPassword) creds)
                     continue;
                 }
 
-                // Archive = move out of Inbox into All Mail, exactly what Gmail's
-                // own Archive button does; the message stays findable in All Mail.
-                var subjectLabel = summary.Envelope?.Subject ?? "(no subject)";
-                if (!AnsiConsole.Confirm($"Archive \"{Markup.Escape(subjectLabel)}\"?", defaultValue: true))
+                // Star = the IMAP \Flagged flag, exactly what Gmail's own star
+                // button sets; it shows up starred in every other Gmail client.
+                if (action == ConsoleKey.S)
+                {
+                    var starring = !IsStarred(summary);
+                    var ok = await AnsiConsole.Status().StartAsync(starring ? "Starring..." : "Unstarring...",
+                        async _ =>
+                        {
+                            try
+                            {
+                                if (starring)
+                                    await imap.Inbox.AddFlagsAsync(summary.UniqueId, MessageFlags.Flagged, silent: true);
+                                else
+                                    await imap.Inbox.RemoveFlagsAsync(summary.UniqueId, MessageFlags.Flagged, silent: true);
+                                return true;
+                            }
+                            catch (Exception ex)
+                            {
+                                AppLog.Debug("star email", ex);
+                                return false;
+                            }
+                        });
+                    if (ok)
+                    {
+                        if (!starToggled.Add(summary.UniqueId.Id)) starToggled.Remove(summary.UniqueId.Id);
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine("[red]Could not update the star — the message is unchanged.[/]\n");
+                        PauseForKey();
+                    }
                     continue;
-
-                var archived = await AnsiConsole.Status().StartAsync("Archiving...", async _ =>
-                {
-                    try
-                    {
-                        var allMail = imap.GetFolder(SpecialFolder.All);
-                        if (allMail == null) return false;
-                        await imap.Inbox.MoveToAsync(summary.UniqueId, allMail);
-                        return true;
-                    }
-                    catch (Exception ex)
-                    {
-                        AppLog.Debug("archive email", ex);
-                        return false;
-                    }
-                });
-                if (archived)
-                {
-                    messages.Remove(summary);
-                    break; // back to the list, which no longer shows this message
                 }
-                AnsiConsole.MarkupLine("[red]Could not archive — the message is unchanged.[/]\n");
-                PauseForKey();
+
+                await ArchiveEmailAsync(summary);
+                if (!messages.Contains(summary))
+                    break; // archived — back to the list, which no longer shows it
             }
         }
 
@@ -5227,7 +5322,33 @@ static async Task ShowTextMessagesAsync()
                 options.Add("<= Back to Main Menu");
 
                 var idx = PromptMenu("Select a conversation:", options, 15, initialSelected: lastIdx,
-                    autoRefresh: MessagesAutoRefresh());
+                    autoRefresh: MessagesAutoRefresh(), action: (ConsoleKey.A, "A archive"));
+                if (MenuActioned(idx, ref lastIdx))
+                {
+                    if (lastIdx < conversations.Count) // not the refresh/back rows
+                    {
+                        var conv = conversations[lastIdx];
+                        if (!AnsiConsole.Confirm($"Archive the conversation with {Markup.Escape(conv.Name)}?",
+                                defaultValue: true))
+                            continue;
+                        var archived = await AnsiConsole.Status().StartAsync("Archiving...", async _ =>
+                        {
+                            // Opening a conversation is what marks it read in Google
+                            // Messages — do that first so it doesn't archive unread.
+                            if (conv.Unread) await TryMarkSmsReadAsync(page, conv.Index);
+                            return await TryArchiveConversationAsync(page, conv.Index);
+                        });
+                        if (!archived)
+                        {
+                            AnsiConsole.MarkupLine(
+                                "[red]Could not find the conversation menu — the page layout may have changed. " +
+                                "Nothing was archived.[/]\n");
+                            PauseForKey();
+                        }
+                        // The loop re-scrapes the live list, which no longer shows it.
+                    }
+                    continue;
+                }
                 // Idle timeout: the loop re-scrapes the live list pane, which is
                 // enough to pick up new messages and unread markers.
                 if (MenuTimedOut(idx, ref lastIdx)) continue;
@@ -5497,6 +5618,22 @@ static async Task ShowSmsConversationAsync(IPage page, int index, string name)
         }
         // Loop: rescrape the thread (now including the reply) and show it again.
     }
+}
+
+// Marks a conversation read the way the web app itself does — by opening it
+// (clicking its list entry) and letting the thread render. Best-effort: a
+// failure here shouldn't block the archive that follows.
+static async Task TryMarkSmsReadAsync(IPage page, int index)
+{
+    try
+    {
+        await page.Locator("mws-conversation-list-item").Nth(index)
+            .ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+        await page.WaitForSelectorAsync("mws-message-wrapper",
+            new PageWaitForSelectorOptions { Timeout = 10000 });
+        await page.WaitForTimeoutAsync(800); // let the read state sync
+    }
+    catch (Exception ex) { AppLog.Debug("sms mark read", ex); }
 }
 
 // Archives a conversation via its LIST entry's hover menu — the verified path:
@@ -7641,6 +7778,512 @@ static string ObsidianToMarkup(ObsidianVault.Vault vault, string text, List<(str
             sb.Append(Styled(raw)).Append('\n');
     }
     return sb.ToString().TrimEnd('\n');
+}
+
+// Paylocity time clock (first pass): drives access.paylocity.com through the
+// same embedded-browser approach as Gemini — one-time sign-in in a plain
+// Chrome window (company SSO/MFA work normally there), then a headless session
+// on the 'paylocity-profile' folder. Paylocity has no employee-level API, and
+// its portal DOM varies per company, so punch buttons are discovered by their
+// visible text; "Save page diagnostics" captures the real page layout so the
+// selectors can be tuned to what this company's portal actually serves.
+static async Task ShowTimeClockAsync()
+{
+    var profileDir = Path.Combine(AppContext.BaseDirectory, "paylocity-profile");
+
+    string? Setting(string key) => Config.Lines("paylocity")
+        .Where(l => l.StartsWith(key + " ", StringComparison.OrdinalIgnoreCase) ||
+                    l.StartsWith(key + "=", StringComparison.OrdinalIgnoreCase))
+        .Where(l => l.Contains('='))
+        .Select(l => l[(l.IndexOf('=') + 1)..].Trim())
+        .FirstOrDefault(v => v.Length > 0);
+
+    var portalUrl = Setting("url") ?? "https://access.paylocity.com/";
+    var timeUrl = Setting("timeurl") ?? "https://webtime2.paylocity.com/WebTime/v3/Employee";
+    var company = Setting("company");
+    var username = Setting("username");
+    var password = Setting("password");
+    // SSO is the default sign-in path (this company uses it); Paylocity-native
+    // form login only kicks in when a username AND password are configured.
+    var useForm = username != null && password != null;
+    if (company == null)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine(
+            "[yellow]The time clock needs your Paylocity company ID.[/]\n\n" +
+            "[grey]Paylocity ends its web session the moment the browser closes, so the app\n" +
+            "signs in fresh on every visit. Add this line under Settings > Paylocity time clock:\n\n" +
+            "  company = your Paylocity company ID\n\n" +
+            "With SSO (this company's setup) nothing else is needed: the first visit opens\n" +
+            "a browser window to sign into the company identity provider once — check\n" +
+            "'Stay signed in' there — and later visits sign in silently. Companies using\n" +
+            "Paylocity's own login would instead also add username = and password = lines.[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    IPlaywright? playwright = null;
+    IBrowserContext? context = null;
+    IPage? page = null;
+    try
+    {
+        playwright = await Playwright.CreateAsync();
+        context = await AnsiConsole.Status().StartAsync("Starting embedded browser...",
+            async _ => await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true));
+        page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+
+        // Paylocity ends its web session when the browser closes (session-only
+        // cookies — verified 2026-09-01: three plain-window sign-ins in a row
+        // came back to the login page headlessly). So unlike the other
+        // embedded-browser sections there is no session to persist; the app
+        // logs in fresh every visit. The profile still matters: it carries the
+        // 'remember this device' trust cookie that lets those logins skip MFA.
+        async Task<string> OpenAndLoginAsync()
+        {
+            await page!.GotoAsync(portalUrl, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 60000
+            });
+            await Task.Delay(4000); // login page and hub both render client-side
+            if (await page.EvaluateAsync<bool>("() => !document.querySelector('input[type=password]')"))
+                return "ok"; // an unexpectedly live session — use it
+            return useForm
+                ? await TryPaylocityLoginAsync(page, company, username!, password!)
+                : await TryPaylocitySsoAsync(page, company);
+        }
+
+        var result = await AnsiConsole.Status().StartAsync("Signing into Paylocity...",
+            async _ => await OpenAndLoginAsync());
+
+        for (var attempt = 1; result is "mfa" or "interactive"; attempt++)
+        {
+            // One-time per device: complete the sign-in in a plain Chrome window
+            // (automation flags can trip it). The Paylocity session it creates
+            // dies with the window — what's kept is the durable part: the MFA
+            // trust cookie (form login) or the identity provider's own session
+            // (SSO). The headless sign-in is retried after.
+            await context.DisposeAsync();
+            await Task.Delay(1500); // let Chrome fully release the profile first
+
+            AnsiConsole.MarkupLine(result == "mfa"
+                ? "[yellow]Paylocity wants a verification code for this device (one-time).[/]\n" +
+                  "[grey]A regular Chrome window will open. Sign in, complete the code prompt, and\n" +
+                  "check 'Remember this device' so future logins here skip it. Then close ALL\n" +
+                  "windows of that browser to continue.[/]\n"
+                : "[yellow]Your company sign-in (SSO) needs a one-time real sign-in on this device.[/]\n" +
+                  "[grey]A regular Chrome window will open. Click 'Single Sign-On Login', sign in with\n" +
+                  "your company account, and check 'Stay signed in' / 'Remember me' if offered —\n" +
+                  "that's what lets future visits sign in silently. Wait until the Paylocity\n" +
+                  "dashboard loads, then close ALL windows of that browser to continue.[/]\n");
+            PauseForKey();
+
+            var browserExe = FindBrowserExe();
+            AnsiConsole.MarkupLine($"[grey]Opening {Markup.Escape(Path.GetFileName(browserExe))}...[/]");
+            var signinWatch = Stopwatch.StartNew();
+            var signinProc = Process.Start(new ProcessStartInfo(browserExe,
+                $"--user-data-dir=\"{profileDir}\" --no-first-run --no-default-browser-check --new-window {portalUrl}")
+            {
+                UseShellExecute = false
+            });
+            AnsiConsole.MarkupLine("[grey]Waiting for you to finish and close the browser window...[/]");
+            if (signinProc != null) await signinProc.WaitForExitAsync();
+            if (signinWatch.Elapsed < TimeSpan.FromSeconds(3))
+                AnsiConsole.MarkupLine(
+                    "[yellow]The browser closed immediately, so you probably never saw a window.\n" +
+                    "Another browser process is likely holding the Paylocity profile — close all\n" +
+                    "Chrome/Edge windows (check the system tray too), then retry.[/]\n");
+            await Task.Delay(1500); // and release it again before the headless relaunch
+
+            context = await LaunchMessagesBrowserAsync(playwright, profileDir, headless: true);
+            page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            result = await AnsiConsole.Status().StartAsync("Signing into Paylocity...",
+                async _ => await OpenAndLoginAsync());
+
+            if (result is "mfa" or "interactive" && attempt >= 2)
+                throw new InvalidOperationException(result == "mfa"
+                    ? "Paylocity still asks for a verification code — the device trust didn't stick. " +
+                      "Make sure 'Remember this device' was checked before closing the window."
+                    : "The SSO sign-in still doesn't complete silently — the identity provider's " +
+                      "session didn't persist. Make sure 'Stay signed in' was checked before " +
+                      "closing the window; some providers also cap silent sign-in by policy.");
+        }
+
+        if (result != "ok")
+        {
+            await DumpPageDiagnosticsAsync(page, "paylocity");
+            throw new InvalidOperationException(useForm
+                ? "Paylocity didn't accept the sign-in — check the company/username/password " +
+                  "lines in Settings > Paylocity time clock."
+                : "Couldn't drive the Single Sign-On flow — check the company line in " +
+                  "Settings > Paylocity time clock, and see data/paylocity-debug.txt for " +
+                  "what the page showed.");
+        }
+
+        // Jump straight to the Time & Labor employee page (verified home of the
+        // punch tile); the in-menu link hop remains as fallback if it 404s or
+        // the webtime subdomain differs (timeurl = ... overrides it).
+        await AnsiConsole.Status().StartAsync("Opening the time clock...", async _ =>
+        {
+            try
+            {
+                await page!.GotoAsync(timeUrl, new PageGotoOptions
+                {
+                    WaitUntil = WaitUntilState.DOMContentLoaded,
+                    Timeout = 45000
+                });
+                await Task.Delay(4000); // token-handoff redirects + tile render
+            }
+            catch (Exception ex) { AppLog.Debug("paylocity time page", ex); }
+        });
+
+        await ShowTimeClockMenuAsync(page);
+        AnsiConsole.Clear();
+    }
+    catch (PlaywrightException ex)
+    {
+        AnsiConsole.MarkupLine(
+            $"[red]Browser automation error:[/] {Markup.Escape(ex.Message)}\n" +
+            "[grey]If sign-in broke or the page changed, delete the 'paylocity-profile' folder " +
+            "next to the app and sign in again.[/]\n");
+        await DumpPageDiagnosticsAsync(page, "paylocity");
+        PauseForKey();
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Time clock error:[/] {Markup.Escape(ex.Message)}\n");
+        await DumpPageDiagnosticsAsync(page, "paylocity");
+        PauseForKey();
+    }
+    finally
+    {
+        if (context != null) await context.DisposeAsync();
+        playwright?.Dispose();
+    }
+}
+
+// Fills Paylocity's login form (Company ID / Username / Password, per the
+// captured login page) and reports where it landed: "ok" (signed in), "mfa"
+// (a verification-code challenge — needs one visible-browser pass to trust
+// this device), or "login" (still on the login page — likely bad credentials).
+static async Task<string> TryPaylocityLoginAsync(IPage page, string company, string username, string password)
+{
+    async Task<bool> FillAsync(string selectors, string value)
+    {
+        foreach (var sel in selectors.Split('|'))
+        {
+            var loc = page.Locator(sel.Trim());
+            try
+            {
+                if (await loc.CountAsync() == 0) continue;
+                await loc.First.FillAsync(value, new LocatorFillOptions { Timeout = 4000 });
+                return true;
+            }
+            catch { /* try the next selector */ }
+        }
+        return false;
+    }
+
+    if (!await FillAsync("#CompanyId | input[name='CompanyId'] | input[id*='company' i] | input[name*='company' i]", company) ||
+        !await FillAsync("#Username | input[name='Username'] | input[id*='user' i]:not([type='password']) | input[name*='user' i]:not([type='password'])", username) ||
+        !await FillAsync("#Password | input[type='password']", password))
+        return "login";
+
+    // The Login button (exact text first — 'Single Sign-On Login' also
+    // contains 'Login'); Enter in the password box is the last resort.
+    try
+    {
+        await page.ClickAsync("#LoginButton, button:text-is('Login'), input[type='submit'], button:has-text('Login')",
+            new PageClickOptions { Timeout = 4000 });
+    }
+    catch
+    {
+        try { await page.Locator("input[type='password']").First.PressAsync("Enter"); }
+        catch { return "login"; }
+    }
+
+    await Task.Delay(6000); // full postback plus the client-side hub render
+    return await page.EvaluateAsync<string>(@"() => {
+        if (/(verification|security|one[- ]?time)\s*code|verify your identity|multi[- ]?factor|two[- ]?factor/i.test(document.body.innerText))
+            return 'mfa';
+        return document.querySelector('input[type=password]') ? 'login' : 'ok';
+    }");
+}
+
+// SP-initiated SSO: clicks the login page's 'Single Sign-On Login' link, gives
+// it the company id, and lets the identity provider's saved session finish the
+// sign-in silently. Returns "ok" (landed on the hub), "interactive" (the
+// provider wants a real sign-in — one visible pass with 'Stay signed in'
+// checked makes future visits silent), or "login" (couldn't drive the flow).
+static async Task<string> TryPaylocitySsoAsync(IPage page, string company)
+{
+    try
+    {
+        var clicked = await page.EvaluateAsync<bool>(@"() => {
+            for (const e of document.querySelectorAll('a, button')) {
+                const t = ((e.innerText || '') + '').trim();
+                if (/single sign[- ]?on/i.test(t)) {
+                    if (e.tagName === 'A') e.removeAttribute('target');
+                    e.click();
+                    return true;
+                }
+            }
+            return false;
+        }");
+        if (!clicked) return "login";
+        await Task.Delay(3000);
+
+        // Still on a Paylocity page asking for the company id? Fill and submit.
+        // (The URL guard keeps this from typing into an identity provider's form
+        // if the redirect already happened.)
+        try
+        {
+            if (new Uri(page.Url).Host.EndsWith("paylocity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                var companyBox = page.Locator(
+                    "#CompanyId, input[name='CompanyId'], input[id*='company' i], input[name*='company' i], input[type='text']");
+                if (await companyBox.CountAsync() > 0)
+                {
+                    await companyBox.First.FillAsync(company, new LocatorFillOptions { Timeout = 4000 });
+                    try
+                    {
+                        await page.ClickAsync(
+                            "button[type='submit'], input[type='submit'], button:text-is('Login'), button:has-text('Continue')",
+                            new PageClickOptions { Timeout = 4000 });
+                    }
+                    catch { await companyBox.First.PressAsync("Enter"); }
+                }
+            }
+        }
+        catch (Exception ex) { AppLog.Debug("paylocity sso company", ex); }
+
+        // Let the redirect chain (Paylocity -> identity provider -> Paylocity)
+        // play out; with a live provider session this completes hands-free.
+        for (var waited = 0; waited < 30000; waited += 2000)
+        {
+            await Task.Delay(2000);
+            if (!new Uri(page.Url).Host.EndsWith("paylocity.com", StringComparison.OrdinalIgnoreCase))
+                continue; // parked at the provider — silent sign-in may still be running
+            var atLogin = await page.EvaluateAsync<bool>(
+                "() => !!document.querySelector('input[type=password]') || " +
+                "/single sign[- ]?on login/i.test(document.body.innerText)");
+            if (!atLogin) return "ok";
+        }
+        // Never made it back to a signed-in Paylocity page: the provider wants
+        // interaction (first run, expired session, or a policy re-prompt).
+        return "interactive";
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("paylocity sso", ex);
+        return "login";
+    }
+}
+
+// The punch screen. Scans the CURRENT page for anything that looks like a
+// punch control and shows the surrounding tile's text as the status line.
+// Every punch is confirmed first — these are real timecard entries — and the
+// page is rescanned afterwards so the new state is read, never assumed.
+static async Task ShowTimeClockMenuAsync(IPage page)
+{
+    const string rescan = "== Rescan the page ==";
+    const string openTime = "== Try opening the time section ==";
+    const string diagnostics = "== Save page diagnostics ==";
+    var lastIdx = 0;
+    var triedTimeHop = false;
+    while (true)
+    {
+        var (buttons, tile, body) = await AnsiConsole.Status().StartAsync("Reading the page...",
+            async _ => await ScrapeTimeClockAsync(page));
+
+        // No punch tile here? One silent hop into Time & Labor before showing
+        // an empty screen (a login can land on the HR hub instead).
+        if (buttons.Count == 0 && !triedTimeHop)
+        {
+            triedTimeHop = true;
+            if (await AnsiConsole.Status().StartAsync("Opening the time section...",
+                    async _ => await TryOpenTimeSectionAsync(page)))
+                continue;
+        }
+
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold blue]Time clock[/] [grey]— Paylocity[/]");
+        WriteTimeClockStatus(tile, body);
+        if (buttons.Count == 0)
+            AnsiConsole.MarkupLine(
+                "[yellow]No punch buttons found on this page. Try the time section below — or save\n" +
+                "diagnostics and share data/paylocity-debug.txt/.png so the selectors can be tuned.[/]");
+
+        var options = buttons.Select(b => $"[bold]{Markup.Escape(b)}[/]").ToList();
+        options.Add(rescan);
+        options.Add(openTime);
+        options.Add(diagnostics);
+        options.Add("<= Back to Main Menu");
+
+        var idx = PromptMenu("Pick an action:", options, 15,
+            initialSelected: Math.Min(lastIdx, options.Count - 1));
+        if (idx < 0 || idx == options.Count - 1) return;
+        lastIdx = idx;
+
+        if (options[idx] == rescan) continue;
+
+        if (options[idx] == openTime)
+        {
+            var opened = await AnsiConsole.Status().StartAsync("Looking for a time link...",
+                async _ => await TryOpenTimeSectionAsync(page));
+            if (!opened)
+            {
+                AnsiConsole.MarkupLine("[yellow]Couldn't find a Time & Labor / time-entry link on this page.[/]\n");
+                PauseForKey();
+            }
+            continue;
+        }
+
+        if (options[idx] == diagnostics)
+        {
+            await DumpPageDiagnosticsAsync(page, "paylocity",
+                $"punch buttons found: {(buttons.Count > 0 ? string.Join(", ", buttons) : "(none)")}");
+            PauseForKey();
+            continue;
+        }
+
+        var label = buttons[idx];
+        if (!AnsiConsole.Confirm($"Punch [bold]{Markup.Escape(label)}[/] now? This is a real timecard entry.",
+                defaultValue: false))
+            continue;
+        try
+        {
+            var after = await AnsiConsole.Status().StartAsync($"Punching {label}...", async _ =>
+            {
+                await page.ClickAsync($"[data-dailyshell-punch='{idx}']", new PageClickOptions { Timeout = 8000 });
+                await Task.Delay(3500); // let the punch round-trip and the tile update
+                return await ScrapeTimeClockAsync(page);
+            });
+            // Report what Paylocity itself now shows, not what was clicked.
+            var confirmed = Regex.Match(after.Body, @"Last Punch:\s*([^\n]+)");
+            AnsiConsole.MarkupLine(confirmed.Success
+                ? $"[green]Done.[/] Paylocity now shows: [bold]{Markup.Escape(confirmed.Groups[1].Value.Trim())}[/]\n"
+                : $"[yellow]Clicked {Markup.Escape(label)}, but couldn't read the new punch state — " +
+                  "verify your timecard in Paylocity.[/]\n");
+            PauseForKey();
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]The click failed — treat this punch as NOT made:[/] {Markup.Escape(ex.Message)}\n");
+            AppLog.Debug("paylocity punch", ex);
+            PauseForKey();
+        }
+    }
+}
+
+// Renders the punch tile's state parsed from the page text. Verified shapes
+// (Sep 2026 dump): "Clocked In4h : 27m", "Last Punch: Clock In at 06:00 AM on
+// 09/01/2026", "Cost Center: DT00005 - Information Technology", and time-off
+// rows of NAME / available / current ("PERSONAL TIME OFF" / "12.00h" /
+// "16.00h"). Falls back to the raw tile text when none of it matches.
+static void WriteTimeClockStatus(string tile, string body)
+{
+    var state = Regex.Match(body, @"Clocked\s+(In|Out)\s*((?:\d+h\s*:\s*\d+m)?)");
+    var lastPunch = Regex.Match(body, @"Last Punch:\s*([^\n]+)");
+    var costCenter = Regex.Match(body, @"Cost Center:\s*([^\n]+)");
+
+    if (state.Success)
+    {
+        var duration = state.Groups[2].Value.Replace(" ", "");
+        AnsiConsole.MarkupLine(state.Groups[1].Value == "In"
+            ? $"[bold green]● Clocked In[/]{(duration.Length > 0 ? $"  [green]{duration}[/]" : "")}"
+            : "[bold]○ Clocked Out[/]");
+    }
+    if (lastPunch.Success || costCenter.Success)
+        AnsiConsole.MarkupLine("[grey]" + Markup.Escape(string.Join(" · ",
+            new[]
+            {
+                lastPunch.Success ? "Last punch: " + lastPunch.Groups[1].Value.Trim() : null,
+                costCenter.Success ? costCenter.Groups[1].Value.Trim() : null,
+            }.Where(s => s != null))) + "[/]");
+
+    var balances = Regex.Matches(body,
+            @"^([A-Z][A-Z0-9 &/-]{2,40})\r?\n(\d+\.\d{2})h\r?\n\d+\.\d{2}h$", RegexOptions.Multiline)
+        .Select(m => $"{m.Groups[1].Value.Trim()} {m.Groups[2].Value}h")
+        .ToList();
+    if (balances.Count > 0)
+        AnsiConsole.MarkupLine(
+            $"[grey]Time off available: {Markup.Escape(string.Join(" · ", balances))}[/]");
+
+    if (!state.Success && !lastPunch.Success && tile.Length > 0)
+        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(string.Join(" · ",
+            tile.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).Take(10)))}[/]");
+}
+
+// Tags every visible punch-looking control with data-dailyshell-punch=<n> and
+// returns their labels, the innerText of the tile containing the first one,
+// and the page body text (for the status/balance parsing above).
+static async Task<(List<string> Buttons, string Tile, string Body)> ScrapeTimeClockAsync(IPage page)
+{
+    var json = await page.EvaluateAsync<string>(@"() => {
+        document.querySelectorAll('[data-dailyshell-punch]').forEach(e => e.removeAttribute('data-dailyshell-punch'));
+        const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const looksLikePunch = t => /((clock|punch)[ -]?(in|out))|((start|end|begin|take|return from)[ -]?(lunch|break|meal))/i.test(t);
+        const labels = [];
+        for (const e of document.querySelectorAll('button, a, [role=button], input[type=button], input[type=submit]')) {
+            const label = ((e.innerText || e.value || e.getAttribute('aria-label') || '') + '').trim().replace(/\s+/g, ' ');
+            if (label.length > 0 && label.length <= 40 && looksLikePunch(label) && visible(e)) {
+                e.setAttribute('data-dailyshell-punch', String(labels.length));
+                labels.push(label);
+            }
+        }
+        let status = '';
+        const first = document.querySelector('[data-dailyshell-punch]');
+        if (first) {
+            let node = first.parentElement;
+            for (let i = 0; i < 6 && node; i++) {
+                const t = (node.innerText || '').trim();
+                if (t.length > 500) break;
+                status = t;
+                node = node.parentElement;
+            }
+        }
+        return JSON.stringify({ labels, status, body: (document.body.innerText || '').substring(0, 8000) });
+    }");
+    using var doc = JsonDocument.Parse(json);
+    var buttons = doc.RootElement.GetProperty("labels").EnumerateArray()
+        .Select(e => e.GetString() ?? "").Where(s => s.Length > 0).ToList();
+    var tile = doc.RootElement.TryGetProperty("status", out var s) ? s.GetString() ?? "" : "";
+    var body = doc.RootElement.TryGetProperty("body", out var b) ? b.GetString() ?? "" : "";
+    return (buttons, tile, body);
+}
+
+// Best-effort hop to the time-entry area: clicks the first link/button whose
+// text mentions Time & Labor / time entry / timesheet — punch tiles sometimes
+// live there rather than on the landing hub. Links are forced to open in
+// place (Paylocity likes target=_blank for its modules).
+static async Task<bool> TryOpenTimeSectionAsync(IPage page)
+{
+    try
+    {
+        var clicked = await page.EvaluateAsync<bool>(@"() => {
+            const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            for (const e of document.querySelectorAll('a, button, [role=button], [role=link], [role=menuitem]')) {
+                const t = ((e.innerText || e.getAttribute('aria-label') || '') + '').trim().replace(/\s+/g, ' ');
+                if (t.length > 0 && t.length <= 40 && visible(e) &&
+                    /time\s*(&|and)\s*labor|time\s*entry|timesheet|time\s*card|web\s*time/i.test(t)) {
+                    if (e.tagName === 'A') e.removeAttribute('target');
+                    e.click();
+                    return true;
+                }
+            }
+            return false;
+        }");
+        if (!clicked) return false;
+        await Task.Delay(5000); // module loads are slow; let it settle before the rescan
+        return true;
+    }
+    catch (Exception ex)
+    {
+        AppLog.Debug("paylocity time link", ex);
+        return false;
+    }
 }
 
 // The primary Gmail account (the first configured one) — used for newsletter

@@ -28,8 +28,8 @@ weather.gov with Open-Meteo as a fallback/supplement.
 **Calendar agenda** — any iCal feeds (e.g. Google Calendar's secret iCal
 address), merged into one upcoming-events view.
 
-**Email inbox** — unread Gmail across one or more accounts; read, reply, and
-archive without leaving the terminal.
+**Email inbox** — unread Gmail across one or more accounts; read, reply,
+star/unstar, and archive without leaving the terminal.
 
 **Text messages** — reads Google Messages for Web through an embedded browser.
 One-time pairing with your phone, then: browse conversations (unread markers),
@@ -64,6 +64,17 @@ headings, task checkboxes, and `[[wikilinks]]` (which `O` follows into the
 Obsidian app). Today's daily note doubles as a quick-capture inbox — `A`
 appends a timestamped line, creating the note from your daily-note template if
 it doesn't exist yet. `E` opens any note in Obsidian itself.
+
+**Time clock** — punch the Paylocity time clock from the terminal (first
+pass): Paylocity ends web sessions on browser close, so the app signs in
+fresh each visit — via the portal's Single Sign-On flow by default (one-time
+browser sign-in to your company's identity provider with "Stay signed in";
+later visits are silent, no password stored), or via Paylocity's own login
+form with credentials from `config.txt`. It then discovers the punch buttons
+on the page and clicks the one you pick after a confirmation, re-reading the
+page after every punch so the state shown is real. A "Save page diagnostics"
+option captures the portal layout for tuning the selectors. See the cautions
+below.
 
 **Games** — the NYT games, playable at the keyboard: Wordle, The Mini/The
 Midi/full-size Daily crossword, Connections, Strands, and Spelling Bee.
@@ -104,6 +115,7 @@ integrations you want.
 | `[webex]` | Webex section | Client ID + secret of a free integration from [developer.webex.com](https://developer.webex.com/my-apps) (redirect URI `http://localhost:8442/webex`, scope `spark:all`); browser sign-in on first use |
 | `[gemini]` | Gemini chat | Nothing needed for the browser mode (sign in on first use); optional API key from [AI Studio](https://aistudio.google.com/app/apikey) + `model = ...` for local API chats |
 | `[obsidian]` | Obsidian notes | Nothing needed (vaults auto-detect); optionally a vault path or `Label \| path` per line |
+| `[paylocity]` | Time clock | `company = ...` (always); SSO companies need nothing else — non-SSO also add `username`/`password` lines; optional `url = ...` |
 | `[display]` | Menu header tweaks | `clock`, `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`); `agenda-hide-events` hides events whose title contains a listed name |
 
 Files the app generates (caches, game progress, logs, browser profiles) are
@@ -126,6 +138,13 @@ read).
   your signed-in Google session — an unofficial, scraping-based integration
   that can break when Google changes the page, and automating a consumer
   Google service may be against its terms. Use at your own discretion.
+- **Paylocity**: the Time clock section signs into the Paylocity web portal on
+  every visit (Paylocity's session dies when the browser closes) — via SSO
+  with no stored password, or, for non-SSO companies, with credentials kept in
+  `config.txt` in plain text. Punches made through it are real timecard
+  entries — the app confirms before clicking and re-reads the page after, but
+  verify your timecard in Paylocity until you trust it. Scraping-based, so it
+  can break when Paylocity changes the page.
 - **Credentials** in `config.txt` (app passwords, cookies, tokens) are stored
   in plain text next to the exe — keep the folder private and don't commit it
   anywhere.
