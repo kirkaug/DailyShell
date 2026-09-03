@@ -68,6 +68,15 @@ static class HeaderBar
     public static Task? Refresh;            // in-flight background refresh, if any
 }
 
+// Guard for the F1-F4 section shortcuts (Program.cs's OpenShortcutAsync).
+// While a shortcut-opened section is on screen, further F-key presses are
+// ignored so sections can't stack inside each other. Same idea as
+// Notify.CenterOpen for the N key.
+static class Shortcuts
+{
+    public static bool Open;
+}
+
 // Opt-in debug log. Off by default; enable by setting the DAILYSHELL_DEBUG=1
 // environment variable or creating a data/debug.on file. Keeps diagnostics
 // available without cluttering normal runs.

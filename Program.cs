@@ -82,6 +82,8 @@ while (true)
     if (await Task.WhenAny(menuHeaderTask, Task.Delay(2500)) == menuHeaderTask
         && await menuHeaderTask is { } headerText)
         headerLines.Add(headerText);
+    if (ShortcutHintLine() is { } fkeyLine)
+        headerLines.Add(fkeyLine);
     if (headerLines.Count > 0)
         AnsiConsole.MarkupLine(string.Join("\n", headerLines) + "\n");
 
@@ -1972,6 +1974,116 @@ static async Task OpenNotificationAsync(AppNotification n)
             Notify.Dismiss(n.Key);
             break;
         }
+    }
+}
+
+// Resolves an F-key press to a section id via the [shortcuts] config section
+// ("f1 = texts", one per line; defaults F1 texts, F2 games, F3 email,
+// F4 webex). F1-F12 are assignable except F5, which stays the refresh key in
+// the message views. Returns null for unset keys and unknown section names.
+static string? ShortcutTarget(ConsoleKey key)
+{
+    if (key < ConsoleKey.F1 || key > ConsoleKey.F12 || key == ConsoleKey.F5) return null;
+    var name = $"f{key - ConsoleKey.F1 + 1}";
+
+    foreach (var line in Config.Lines("shortcuts"))
+    {
+        var eq = line.IndexOf('=');
+        if (eq < 0 || !line[..eq].Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+        return line[(eq + 1)..].Trim().ToLowerInvariant() switch
+        {
+            "news" or "newsletters" => "news",
+            "weather" => "weather",
+            "calendar" or "agenda" => "calendar",
+            "tasks" or "todo" or "todos" or "google tasks" => "tasks",
+            "email" or "mail" or "inbox" or "gmail" => "email",
+            "texts" or "sms" or "messages" => "texts",
+            "discord" => "discord",
+            "webex" => "webex",
+            "gemini" => "gemini",
+            "obsidian" or "notes" => "obsidian",
+            "timeclock" or "time clock" or "paylocity" => "timeclock",
+            "games" => "games",
+            "settings" => "settings",
+            _ => null,
+        };
+    }
+    return null;
+}
+
+// The main menu's dim reminder line of the configured F-key jumps, or null
+// when every key is unset.
+static string? ShortcutHintLine()
+{
+    var parts = new List<string>();
+    for (var key = ConsoleKey.F1; key <= ConsoleKey.F12; key++)
+        if (ShortcutTarget(key) is { } target)
+            parts.Add($"F{key - ConsoleKey.F1 + 1} {ShortcutLabel(target)}");
+    return parts.Count == 0 ? null : $"[grey]{string.Join("  ", parts)}[/]";
+}
+
+static string ShortcutLabel(string target) => target switch
+{
+    "news" => "news",
+    "weather" => "weather",
+    "calendar" => "calendar",
+    "tasks" => "tasks",
+    "email" => "email",
+    "texts" => "texts",
+    "discord" => "Discord",
+    "webex" => "Webex",
+    "gemini" => "Gemini",
+    "obsidian" => "Obsidian",
+    "timeclock" => "time clock",
+    "games" => "games",
+    "settings" => "settings",
+    _ => target,
+};
+
+// Opens the section an F1-F4 shortcut points at, inline in whatever view the
+// key was pressed — the same nesting the notification center uses. Backing out
+// of the section lands back where the key was pressed. Shortcuts.Open blocks
+// F-keys inside the jump so sections can't stack.
+static async Task OpenShortcutAsync(string target)
+{
+    Shortcuts.Open = true;
+    try
+    {
+        switch (target)
+        {
+            case "news":
+            {
+                // The main loop's cached lists aren't reachable here; these
+                // loads are cheap config reads.
+                var sources = LoadNewsSources();
+                await ShowNewsMenuAsync(LoadEmailNewsletters(), sources, BuildSourceLookup(sources));
+                break;
+            }
+            case "weather": await ShowWeatherForecastAsync(); break;
+            case "calendar": await ShowCalendarAgendaAsync(); break;
+            case "tasks": await ShowGoogleTasksAsync(); break;
+            case "email": await ShowUnreadEmailAsync(); break;
+            case "texts":
+                if (TextsBrowser.SectionActive)
+                {
+                    AnsiConsole.MarkupLine("[yellow]The Texts section is already open below — back out to it instead.[/]\n");
+                    PauseForKey();
+                    break;
+                }
+                await ShowTextMessagesAsync();
+                break;
+            case "discord": await ShowDiscordAsync(); break;
+            case "webex": await ShowWebexAsync(); break;
+            case "gemini": await ShowGeminiAsync(); break;
+            case "obsidian": ShowObsidian(); break;
+            case "timeclock": await ShowTimeClockAsync(); break;
+            case "games": await ShowGamesMenuAsync(); break;
+            case "settings": ShowSettings(); break;
+        }
+    }
+    finally
+    {
+        Shortcuts.Open = false;
     }
 }
 
@@ -4693,6 +4805,16 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
                 Console.Write(new string('\n', frameHeight));
                 startTop = Math.Max(0, Console.CursorTop - frameHeight);
                 break;
+            case var fkey when fkey >= ConsoleKey.F1 && fkey <= ConsoleKey.F12
+                && !Shortcuts.Open && ShortcutTarget(fkey) is { } jump:
+                Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
+                OpenShortcutAsync(jump).GetAwaiter().GetResult();
+                // Same redraw split as the N case above.
+                if (autoRefresh != null || refreshWhen != null) return -2 - selected;
+                ClearWithHeader();
+                Console.Write(new string('\n', frameHeight));
+                startTop = Math.Max(0, Console.CursorTop - frameHeight);
+                break;
             case ConsoleKey.Escape or ConsoleKey.Backspace or ConsoleKey.Q or ConsoleKey.LeftArrow:
                 Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
                 return -1;
@@ -4839,6 +4961,10 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
                 break;
             case ConsoleKey.N when DisplayOn("notify") && !Notify.CenterOpen:
                 ShowNotificationCenterAsync().GetAwaiter().GetResult();
+                break; // the loop repaints the header and content in full
+            case var fkey when fkey >= ConsoleKey.F1 && fkey <= ConsoleKey.F12
+                && !Shortcuts.Open && ShortcutTarget(fkey) is { } jump:
+                OpenShortcutAsync(jump).GetAwaiter().GetResult();
                 break; // the loop repaints the header and content in full
             case ConsoleKey.Enter or ConsoleKey.Escape or ConsoleKey.Q or ConsoleKey.Backspace or ConsoleKey.LeftArrow:
                 ClearWithHeader();

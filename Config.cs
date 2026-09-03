@@ -159,6 +159,17 @@ static class Config
             "Missing keys fall back to the defaults shown above.",
         ], false,
         ["clock = on", "weather = on", "header = on", "notify = on", "agenda = on", "agenda-items = 3", "agenda-days = 14", "refresh-seconds = 60"]),
+        new("shortcuts", "F-key shortcuts",
+        [
+            "F-keys jump straight to a section from any menu or reader. One per line:",
+            "  f1 = texts",
+            "F1-F12 can be assigned, except F5 — that stays the refresh key.",
+            "(Some terminals grab keys for themselves, e.g. F11 for full screen.)",
+            "Sections: news, weather, calendar, tasks, email, texts, discord,",
+            "webex, gemini, obsidian, timeclock, games, settings",
+            "Remove a line (or set it to off) to disable that key.",
+        ], false,
+        ["f1 = texts", "f2 = games", "f3 = email", "f4 = webex"]),
     ];
 
     public static readonly string FilePath = Path.Combine(AppContext.BaseDirectory, "config.txt");

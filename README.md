@@ -124,6 +124,7 @@ integrations you want.
 | `[obsidian]` | Obsidian notes | Nothing needed (vaults auto-detect); optionally a vault path or `Label \| path` per line |
 | `[paylocity]` | Time clock | `company = ...` (always); SSO companies need nothing else — non-SSO also add `username`/`password` lines; optional `url = ...` |
 | `[display]` | Menu header tweaks | `clock`, `weather`, `agenda`, `agenda-items`, `agenda-days` toggles; `agenda-hide-times` hides events starting at listed times/ranges (e.g. `8:00 AM, 12 PM - 1 PM`); `agenda-hide-events` hides events whose title contains a listed name |
+| `[shortcuts]` | F-key jumps | `f1 = texts` … `f4 = webex` (defaults shown) — which section each F-key opens; F1–F12 assignable except F5 (the refresh key); remove a line or set it to `off` to disable a key |
 
 Files the app generates (caches, game progress, logs, browser profiles) are
 kept in a `data/` subfolder.
@@ -134,6 +135,12 @@ Arrow keys (or `j`/`k`) and Enter everywhere; `←`/`Esc`/`Backspace`/`Q` go
 back. In readers: PgUp/PgDn/Space to page, `O` to open links, plus per-view
 actions shown in the bottom hint bar (e.g. `R` reply, `A` archive, `M` mark
 read).
+
+F-keys jump straight to a section from any menu or reader — by default
+`F1` texts, `F2` games, `F3` email, `F4` Webex, with `F1`–`F12` assignable
+except `F5` (the refresh key). Backing out of the section returns to where
+you pressed the key. Remap them in **Settings → F-key shortcuts**
+(`[shortcuts]` in config.txt).
 
 ## Cautions
 
