@@ -85,3 +85,11 @@ record WebexMessage(string Id, string Author, DateTimeOffset Created, string Tex
 // One Markdown note in an Obsidian vault. RelPath is vault-relative with
 // forward slashes (the form obsidian:// URIs and wikilinks use).
 record ObsidianNote(string RelPath, string Title, DateTime Modified);
+
+// Google Tasks: one task list, and one task within it. Due is date-only (the
+// Tasks API drops any time of day in both directions, so the app doesn't do
+// times at all); ParentId links a subtask to its parent; Position is the
+// API's lexicographic sibling sort key.
+record GoogleTaskList(string Id, string Title);
+record GoogleTask(string Id, string Title, string Notes, DateTime? Due, bool Completed,
+    string? ParentId, string Position);

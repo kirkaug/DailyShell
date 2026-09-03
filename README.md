@@ -1,9 +1,9 @@
 # DailyShell
 
 A personal "morning dashboard" that lives entirely in the terminal: news, email
-newsletters, weather, calendar, email, text messages, Discord, Webex, Obsidian
-notes, and the NYT games — one keyboard-driven app built on .NET and
-[Spectre.Console](https://spectreconsole.net/).
+newsletters, weather, calendar, Google Tasks, email, text messages, Discord,
+Webex, Obsidian notes, and the NYT games — one keyboard-driven app built on
+.NET and [Spectre.Console](https://spectreconsole.net/).
 
 ## Features
 
@@ -27,6 +27,12 @@ weather.gov with Open-Meteo as a fallback/supplement.
 
 **Calendar agenda** — any iCal feeds (e.g. Google Calendar's secret iCal
 address), merged into one upcoming-events view.
+
+**Google Tasks** — your task lists through the official API: browse tasks
+sorted by due date (subtasks nested, dates color-coded), check them off with
+a keypress, add new tasks with natural due dates ("tomorrow", "fri", "9/15"),
+rename, reschedule, and delete. Dates only — Google's API drops due times in
+both directions, so times of day set in Google's apps can't be shown here.
 
 **Email inbox** — unread Gmail across one or more accounts; read, reply,
 star/unstar, and archive without leaving the terminal.
@@ -109,6 +115,7 @@ integrations you want.
 | `[newsletters]` | Custom newsletter list | `Label \| from-address filter \| subject filter (optional)` per line |
 | `[news-sources]` | Preloaded News menu feeds | `Name \| RSS URL` per line |
 | `[calendar]` | Agenda + menu header | iCal URLs, optionally `Label \| URL` |
+| `[google-tasks]` | Google Tasks section | Client ID + secret of an OAuth "Desktop app" client from [console.cloud.google.com](https://console.cloud.google.com) with the Tasks API enabled (steps in Settings); browser sign-in on first use |
 | `[reddit-oauth]` | Reddit scores/comments | Client id + secret from a free 'script' app at reddit.com/prefs/apps |
 | `[nyt-cookies]` | Full NYT article text | Your nytimes.com Cookie header (or use the in-app "Connect NYT account") |
 | `[discord]` | Discord section | Your Discord user token (instructions in Settings) |

@@ -41,6 +41,7 @@ var emailNewsletters = LoadEmailNewsletters();
 const string newsOption = "News & newsletters";
 const string weatherOption = "Weather forecast";
 const string calendarOption = "Calendar agenda";
+const string tasksOption = "Google Tasks";
 const string unreadOption = "Email inbox";
 const string smsOption = "Text messages";
 const string discordOption = "Discord";
@@ -84,7 +85,7 @@ while (true)
     if (headerLines.Count > 0)
         AnsiConsole.MarkupLine(string.Join("\n", headerLines) + "\n");
 
-    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, unreadOption, smsOption, discordOption, webexOption, geminiOption, obsidianOption, timeclockOption, gamesOption, settingsOption, exitOption };
+    var mainOptions = new List<string> { newsOption, weatherOption, calendarOption, tasksOption, unreadOption, smsOption, discordOption, webexOption, geminiOption, obsidianOption, timeclockOption, gamesOption, settingsOption, exitOption };
 
     // While the header fetch is still running, refreshWhen redraws the menu the
     // moment it lands (so a slow first fetch doesn't leave the header blank until
@@ -118,6 +119,12 @@ while (true)
     if (choice == calendarOption)
     {
         await ShowCalendarAgendaAsync();
+        continue;
+    }
+
+    if (choice == tasksOption)
+    {
+        await ShowGoogleTasksAsync();
         continue;
     }
 
@@ -7992,6 +7999,381 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
         }
 
         return;
+    }
+}
+
+// Google Tasks section: task lists through the official API (OAuth link on
+// first use — GoogleTasks.cs). Lists → tasks with subtasks indented, C checks
+// or unchecks the highlighted task, and Enter opens a per-task detail menu.
+static async Task ShowGoogleTasksAsync()
+{
+    if (GoogleTasksApi.Credentials == null)
+    {
+        ClearWithHeader();
+        AnsiConsole.MarkupLine(
+            "[yellow]Google Tasks isn't set up yet.[/]\n\n" +
+            "[grey]Create a free OAuth 'Desktop app' client at console.cloud.google.com and add\n" +
+            "its Client ID and Secret under Settings > Google Tasks (full instructions there).[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    if (!GoogleTasksApi.IsLinked && !await LinkGoogleTasksAsync()) return;
+
+    var lists = await TryFetchTaskListsAsync("Connecting to Google Tasks...");
+    if (lists == null) return;
+    if (lists.Count == 0)
+    {
+        AnsiConsole.MarkupLine("[yellow]No task lists on this account.[/]\n");
+        PauseForKey();
+        return;
+    }
+
+    // One list (the common case) skips the picker.
+    if (lists.Count == 1)
+    {
+        await ShowTaskListAsync(lists[0]);
+        ClearWithHeader();
+        return;
+    }
+
+    var lastIdx = 0;
+    const string refresh = "== Refresh ==";
+    while (true)
+    {
+        ClearWithHeader();
+        AnsiConsole.MarkupLine("[bold blue]Google Tasks[/] [grey]— lists[/]");
+
+        var options = lists.Select(l => Markup.Escape(l.Title)).ToList();
+        options.Add(refresh);
+        options.Add("<= Back to Main Menu");
+
+        var idx = PromptMenu("Select a list:", options, 15, initialSelected: lastIdx);
+        if (idx < 0 || idx == options.Count - 1) break;
+        if (options[idx] == refresh)
+        {
+            lists = await TryFetchTaskListsAsync("Refreshing...") ?? lists;
+            continue;
+        }
+        lastIdx = idx;
+        await ShowTaskListAsync(lists[idx]);
+    }
+    ClearWithHeader();
+}
+
+static async Task ShowTaskListAsync(GoogleTaskList list)
+{
+    async Task<List<GoogleTask>?> FetchAsync(string label)
+    {
+        try
+        {
+            return await AnsiConsole.Status().StartAsync(label,
+                async _ => await GoogleTasksApi.GetTasksAsync(list.Id));
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Google Tasks error:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+            return null;
+        }
+    }
+
+    var tasks = await FetchAsync("Loading tasks...");
+    if (tasks == null) return;
+
+    var showCompleted = false;
+    var lastIdx = 0;
+    while (true)
+    {
+        // Open tasks in due order — earliest date first, undated last, with
+        // Google's manual position breaking ties. Each top-level task is
+        // followed by its open subtasks (the API nests one level); a subtask
+        // whose parent is completed or missing surfaces at the top.
+        static IEnumerable<GoogleTask> DueOrder(IEnumerable<GoogleTask> ts) =>
+            ts.OrderBy(t => t.Due ?? DateTime.MaxValue)
+              .ThenBy(t => t.Position, StringComparer.Ordinal);
+
+        var open = tasks.Where(t => !t.Completed).ToList();
+        var done = tasks.Where(t => t.Completed).ToList();
+        var rows = new List<(string Label, GoogleTask? Task, string Cmd)>
+        {
+            ("[green]+ Add a task[/]", null, "add"),
+        };
+        foreach (var t in DueOrder(open.Where(t => t.ParentId == null || !open.Any(p => p.Id == t.ParentId))))
+        {
+            rows.Add((TaskRow(t, indent: false), t, "task"));
+            foreach (var c in DueOrder(open.Where(c => c.ParentId == t.Id)))
+                rows.Add((TaskRow(c, indent: true), c, "task"));
+        }
+        if (done.Count > 0)
+            rows.Add(($"[grey]{(showCompleted ? "Hide" : "Show")} completed ({done.Count})[/]", null, "toggle"));
+        if (showCompleted)
+            foreach (var t in done)
+                rows.Add(($"[grey][[x]] {Markup.Escape(t.Title)}[/]", t, "task"));
+        rows.Add(("== Refresh ==", null, "refresh"));
+        rows.Add(("<= Back", null, "back"));
+
+        ClearWithHeader();
+        AnsiConsole.MarkupLine($"[bold blue]{Markup.Escape(list.Title)}[/] [grey]— {open.Count} open[/]");
+
+        var idx = PromptMenu("Pick a task:", rows.Select(r => r.Label).ToList(), 15,
+            initialSelected: Math.Min(lastIdx, rows.Count - 1),
+            action: (ConsoleKey.C, "C check/uncheck"));
+        if (MenuActioned(idx, ref lastIdx))
+        {
+            if (rows[lastIdx].Task is { } t)
+            {
+                try
+                {
+                    await AnsiConsole.Status().StartAsync(t.Completed ? "Reopening..." : "Completing...",
+                        async _ => await GoogleTasksApi.SetCompletedAsync(list.Id, t.Id, !t.Completed));
+                    tasks = await FetchAsync("Refreshing...") ?? tasks;
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[red]Couldn't update:[/] {Markup.Escape(ex.Message)}\n");
+                    PauseForKey();
+                }
+            }
+            continue;
+        }
+        if (idx < 0 || rows[idx].Cmd == "back") return;
+        lastIdx = idx;
+
+        switch (rows[idx].Cmd)
+        {
+            case "refresh":
+                tasks = await FetchAsync("Refreshing...") ?? tasks;
+                break;
+            case "toggle":
+                showCompleted = !showCompleted;
+                break;
+            case "add":
+            {
+                var title = PromptReplyLine("[green]New task[/] [grey](leave blank to cancel):[/]");
+                if (title.Length == 0) break;
+                var (due, ok) = ParseDueInput(PromptReplyLine(
+                    "[green]Due[/] [grey](today, tomorrow, fri, 9/15... — blank for none):[/]"));
+                if (!ok)
+                    AnsiConsole.MarkupLine("[yellow]Couldn't read that date — adding the task without one.[/]");
+                try
+                {
+                    await AnsiConsole.Status().StartAsync("Adding...",
+                        async _ => await GoogleTasksApi.AddTaskAsync(list.Id, title, due));
+                    tasks = await FetchAsync("Refreshing...") ?? tasks;
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[red]Couldn't add:[/] {Markup.Escape(ex.Message)}\n");
+                    PauseForKey();
+                }
+                break;
+            }
+            case "task":
+                if (await ShowTaskDetailAsync(list, rows[idx].Task!))
+                    tasks = await FetchAsync("Refreshing...") ?? tasks;
+                break;
+        }
+    }
+}
+
+static string TaskRow(GoogleTask t, bool indent) =>
+    $"{(indent ? "    " : "")}[[ ]] {Markup.Escape(t.Title)}{(t.Due is { } d ? "  " + DueText(d) : "")}";
+
+// Compact colored due-date badge: red when overdue, yellow today.
+static string DueText(DateTime due)
+{
+    var today = DateTime.Today;
+    var text = due == today ? "today"
+        : due == today.AddDays(1) ? "tomorrow"
+        : due.Year == today.Year ? due.ToString("MMM d") : due.ToString("MMM d, yyyy");
+    return due < today ? $"[red]{text} (overdue)[/]"
+        : due == today ? $"[yellow]{text}[/]"
+        : $"[grey]{text}[/]";
+}
+
+// One task's detail plus its actions. Returns true when something changed so
+// the list view refetches.
+static async Task<bool> ShowTaskDetailAsync(GoogleTaskList list, GoogleTask task)
+{
+    var changed = false;
+    while (true)
+    {
+        ClearWithHeader();
+        AnsiConsole.MarkupLine($"[bold]{Markup.Escape(task.Title)}[/]");
+        AnsiConsole.MarkupLine(task.Completed ? "[green]Completed[/]" : "[grey]Not done yet[/]");
+        if (task.Due is { } d) AnsiConsole.MarkupLine($"Due: {DueText(d)}");
+        if (task.Notes.Length > 0) AnsiConsole.MarkupLine($"\n{Markup.Escape(task.Notes)}");
+        AnsiConsole.WriteLine();
+
+        var options = new List<string>
+        {
+            task.Completed ? "Mark as not done" : "Mark as done",
+            "Rename",
+            "Change due date",
+            "[red]Delete task[/]",
+            "<= Back",
+        };
+        var idx = PromptMenu("Do what?", options, 15);
+        try
+        {
+            switch (idx)
+            {
+                case 0:
+                    await AnsiConsole.Status().StartAsync("Updating...",
+                        async _ => await GoogleTasksApi.SetCompletedAsync(list.Id, task.Id, !task.Completed));
+                    task = task with { Completed = !task.Completed };
+                    changed = true;
+                    break;
+                case 1:
+                {
+                    var title = PromptReplyLine("[green]New name[/] [grey](leave blank to cancel):[/]");
+                    if (title.Length == 0) break;
+                    await AnsiConsole.Status().StartAsync("Renaming...",
+                        async _ => await GoogleTasksApi.RenameTaskAsync(list.Id, task.Id, title));
+                    task = task with { Title = title };
+                    changed = true;
+                    break;
+                }
+                case 2:
+                {
+                    var (due, ok) = ParseDueInput(PromptReplyLine(
+                        "[green]Due[/] [grey](today, tomorrow, fri, 9/15... — blank to clear):[/]"));
+                    if (!ok)
+                    {
+                        AnsiConsole.MarkupLine("[yellow]Couldn't read that date — nothing changed.[/]");
+                        PauseForKey();
+                        break;
+                    }
+                    await AnsiConsole.Status().StartAsync("Updating...",
+                        async _ => await GoogleTasksApi.SetDueAsync(list.Id, task.Id, due));
+                    task = task with { Due = due };
+                    changed = true;
+                    break;
+                }
+                case 3:
+                    if (!AnsiConsole.Confirm($"Delete \"{Markup.Escape(task.Title)}\"?", defaultValue: false)) break;
+                    await AnsiConsole.Status().StartAsync("Deleting...",
+                        async _ => await GoogleTasksApi.DeleteTaskAsync(list.Id, task.Id));
+                    return true;
+                default:
+                    return changed;
+            }
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Google Tasks error:[/] {Markup.Escape(ex.Message)}\n");
+            PauseForKey();
+        }
+    }
+}
+
+// Due-date input: "today", "tomorrow", a weekday name or 3+ letter prefix
+// (next occurrence), or anything DateTime.TryParse reads ("9/15", "sep 15").
+// Blank = no due date (still Ok); unreadable input returns Ok = false. Times
+// of day aren't supported: Google's API discards them in both directions.
+static (DateTime? Due, bool Ok) ParseDueInput(string input)
+{
+    var s = input.Trim().ToLowerInvariant();
+    if (s.Length == 0) return (null, true);
+    var today = DateTime.Today;
+    if (s == "today") return (today, true);
+    if (s is "tomorrow" or "tmw" or "tmrw") return (today.AddDays(1), true);
+    for (var i = 1; i <= 7; i++)
+    {
+        var day = today.AddDays(i);
+        if (s.Length >= 3 && day.DayOfWeek.ToString().ToLowerInvariant().StartsWith(s))
+            return (day, true);
+    }
+    return DateTime.TryParse(s, out var d) ? (d.Date, true) : (null, false);
+}
+
+// One-time Google OAuth link: browser sign-in caught on a loopback listener
+// (port 8443), with a paste-the-URL fallback when the port is taken — the
+// same shape as the Webex link.
+static async Task<bool> LinkGoogleTasksAsync()
+{
+    ClearWithHeader();
+    AnsiConsole.MarkupLine("[bold blue]Google Tasks[/] [grey]— one-time sign-in[/]\n");
+
+    var state = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+    var authUrl = GoogleTasksApi.BuildAuthUrl(state);
+    var listener = GoogleTasksApi.TryStartLoopbackListener();
+
+    string? code = null;
+    if (listener != null)
+    {
+        AnsiConsole.MarkupLine(
+            "[grey]A browser window will open — sign in with Google and allow access.\n" +
+            "(An 'unverified app' warning is normal for a personal Cloud project:\n" +
+            "Advanced > continue.)[/]\n");
+        OpenInBrowser(authUrl);
+        try
+        {
+            code = await AnsiConsole.Status().StartAsync("Waiting for the browser sign-in (up to 5 minutes)...",
+                async _ =>
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+                    return await GoogleTasksApi.WaitForCodeAsync(listener, state, cts.Token);
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[yellow]Timed out waiting for the sign-in.[/]\n");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Google sign-in failed:[/] {Markup.Escape(ex.Message)}\n");
+        }
+    }
+    else
+    {
+        OpenInBrowser(authUrl);
+        AnsiConsole.MarkupLine(
+            "[grey]Couldn't listen on localhost:8443, so after you allow access the browser\n" +
+            "will show an unreachable-page error — copy that page's full URL (it carries the code).[/]\n");
+        var pasted = PromptReplyLine("[green]Paste the redirected URL here[/] [grey](leave blank to cancel):[/]");
+        if (pasted.Length > 0)
+        {
+            code = GoogleTasksApi.CodeFromRedirectUrl(pasted, state);
+            if (code == null)
+                AnsiConsole.MarkupLine("[yellow]That URL didn't contain a matching sign-in code.[/]\n");
+        }
+    }
+
+    if (code == null)
+    {
+        PauseForKey();
+        return false;
+    }
+
+    try
+    {
+        await AnsiConsole.Status().StartAsync("Finishing the Google Tasks link...",
+            async _ => await GoogleTasksApi.ExchangeCodeAsync(code));
+        AnsiConsole.MarkupLine("[green]Google Tasks linked.[/]\n");
+        return true;
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Couldn't finish the link:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return false;
+    }
+}
+
+static async Task<List<GoogleTaskList>?> TryFetchTaskListsAsync(string label)
+{
+    try
+    {
+        return await AnsiConsole.Status().StartAsync(label,
+            async _ => await GoogleTasksApi.GetListsAsync());
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Google Tasks error:[/] {Markup.Escape(ex.Message)}\n");
+        PauseForKey();
+        return null;
     }
 }
 
