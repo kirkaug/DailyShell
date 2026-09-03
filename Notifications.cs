@@ -20,6 +20,7 @@ static class Notify
 
     public static DateTimeOffset LastPollAt;   // MinValue until the first poll lands
     public static bool CenterOpen;             // blocks nested N presses
+    public static bool ColonHint;              // in a line-input game: header says ":n" not "N"
 
     // Latest source snapshots, kept so the center can deep-link without
     // refetching (a jump uses the same data the notification came from).

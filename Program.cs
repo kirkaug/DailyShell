@@ -1626,7 +1626,7 @@ static string? ClockHeaderLine()
     var count = DisplayOn("notify") ? Notify.Count : 0;
     if (count == 0) return clock;
 
-    var chip = $"[bold yellow]● {count} new[/] [grey]— N to view[/]";
+    var chip = $"[bold yellow]● {count} new[/] [grey]— {(Notify.ColonHint ? "\":n\"" : "N")} to view[/]";
     if (clock == null) return chip;
     var pad = Math.Max(2, Console.WindowWidth - 1 - Markup.Remove(clock).Length - Markup.Remove(chip).Length);
     return clock + new string(' ', pad) + chip;
@@ -1642,6 +1642,7 @@ static void ClearWithHeader()
     var header = PersistentHeaderLines();
     if (header.Count > 0)
         AnsiConsole.MarkupLine(string.Join("\n", header) + "\n");
+    Notify.ColonHint = false; // consumed on draw; game loops re-set it each frame
 }
 
 // ----- Notifications -----------------------------------------------------
@@ -1902,6 +1903,20 @@ static async Task ShowNotificationCenterAsync()
     {
         Notify.CenterOpen = false;
     }
+}
+
+// ":n" from the line-input games (Spelling Bee, Wordle, Connections, Strands)
+// opens the notification center — a bare N there is just a letter in a guess,
+// so the header's "N to view" hint needs a colon form. Returns true when the
+// input was the command (handled or not), so callers skip it as a guess.
+static async Task<bool> HandleNotificationsCommandAsync(string word)
+{
+    if (!word.Equals(":n", StringComparison.OrdinalIgnoreCase) &&
+        !word.Equals(":notifications", StringComparison.OrdinalIgnoreCase))
+        return false;
+    if (DisplayOn("notify") && !Notify.CenterOpen)
+        await ShowNotificationCenterAsync();
+    return true;
 }
 
 // Jumps to where a notification lives: the email itself, or the text/Webex/
@@ -2381,7 +2396,8 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
     var outer = puzzle.OuterLetters.Select(s => s.ToUpperInvariant()).ToList();
     var showHintsPanel = false;
     IRenderable? extraHints = null; // fetched on first ":extrahints", then reused
-    var message = "[grey]Type a word and press Enter. Blank line shuffles. \":hint\" popup, \":hints\" side-by-side, \":q\" to quit.[/]";
+    var message = "[grey]Type a word and press Enter. Blank line shuffles. \":hint\" popup, \":hints\" side-by-side, " +
+                  (DisplayOn("notify") ? "\":n\" notifications, " : "") + "\":q\" to quit.[/]";
 
     // Live sync: a background pump pushes the latest snapshot to NYT as words are
     // found, chaining until caught up — so the final state syncs even if the player
@@ -2400,6 +2416,7 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
 
     while (true)
     {
+        Notify.ColonHint = true;
         ClearWithHeader();
 
         var (rankName, nextInfo) = BeeRank(score, totalScore);
@@ -2470,6 +2487,7 @@ static async Task PlaySpellingBeeAsync(SpellingBeePuzzle? archivePuzzle = null)
         var word = input.Trim().ToLowerInvariant();
 
         if (word is ":q" or ":quit" or "quit") break;
+        if (await HandleNotificationsCommandAsync(word)) continue;
         if (word is ":hints")                              // toggle the side panel
         {
             showHintsPanel = !showHintsPanel;
@@ -2938,10 +2956,12 @@ static async Task PlayConnectionsAsync(string? archiveDate = null)
     }
     if (solved.Count > 0 || mistakes > 0) MaybePushConnections();
 
-    var message = "[grey]Enter the 4 numbers of a group (e.g. \"1 6 9 14\"). \":q\" to quit.[/]";
+    var message = "[grey]Enter the 4 numbers of a group (e.g. \"1 6 9 14\"). " +
+                  (DisplayOn("notify") ? "\":n\" notifications, " : "") + "\":q\" to quit.[/]";
 
     while (true)
     {
+        Notify.ColonHint = true;
         ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Connections[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]" +
             (syncer.Failed ? "   [red](NYT sync failing — reconnect NYT account)[/]" : "") + "\n");
@@ -2991,6 +3011,7 @@ static async Task PlayConnectionsAsync(string? archiveDate = null)
         AnsiConsole.Markup("[green]> [/]");
         var input = Console.ReadLine();
         if (input == null || input.Trim() is ":q" or ":quit" or "quit") break;
+        if (await HandleNotificationsCommandAsync(input.Trim())) continue;
 
         var nums = System.Text.RegularExpressions.Regex.Matches(input, @"\d+")
             .Select(m => int.Parse(m.Value)).Distinct().ToList();
@@ -3191,10 +3212,12 @@ static async Task PlayStrandsAsync(string? archiveDate = null)
     }
     if (found.Count > 0) MaybePushStrands(); // sync any local-only words up on open
 
-    var message = "[grey]Type a theme word you spot. \":q\" to quit.[/]";
+    var message = "[grey]Type a theme word you spot. " +
+                  (DisplayOn("notify") ? "\":n\" notifications, " : "") + "\":q\" to quit.[/]";
 
     while (true)
     {
+        Notify.ColonHint = true;
         ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Strands[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]" +
             (syncer.Failed ? "   [red](NYT sync failing — reconnect NYT account)[/]" : ""));
@@ -3244,6 +3267,7 @@ static async Task PlayStrandsAsync(string? archiveDate = null)
         if (input == null) break;
         var word = input.Trim().ToUpperInvariant();
         if (word is ":Q" or ":QUIT" or "QUIT") break;
+        if (await HandleNotificationsCommandAsync(word)) continue;
         if (word.Length == 0) continue;
 
         if (found.Contains(word)) message = "[grey]Already found.[/]";
@@ -3759,11 +3783,13 @@ static async Task PlayWordleAsync(string? archiveDate = null)
     foreach (var g in guesses) UpdateWordleKeyState(keyState, g, solution);
 
     var message = status == "IN_PROGRESS"
-        ? "[grey]Type a 5-letter guess and press Enter. \":q\" to quit.[/]"
+        ? "[grey]Type a 5-letter guess and press Enter. " +
+          (DisplayOn("notify") ? "\":n\" notifications, " : "") + "\":q\" to quit.[/]"
         : "";
 
     while (true)
     {
+        Notify.ColonHint = true;
         ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Wordle[/] [dim]{Markup.Escape(puzzle.PrintDate)}[/]{syncNote}\n");
 
@@ -3798,6 +3824,7 @@ static async Task PlayWordleAsync(string? archiveDate = null)
         var guess = input.Trim().ToLowerInvariant();
 
         if (guess is ":q" or ":quit" or "quit") break;
+        if (await HandleNotificationsCommandAsync(guess)) continue;
         if (guess.Length != 5 || !guess.All(char.IsLetter))
         {
             message = "[yellow]Guesses must be exactly 5 letters.[/]";
