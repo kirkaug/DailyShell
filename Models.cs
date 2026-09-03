@@ -80,7 +80,13 @@ record WebexRoom(string Id, string Title, bool Direct, DateTimeOffset LastActivi
 
 // One Webex message, flattened for terminal display (attachment and card notes
 // are folded into Text). Author is resolved to a display name via the people API.
-record WebexMessage(string Id, string Author, DateTimeOffset Created, string Text);
+// ParentId is the thread root's message id when this is a threaded reply.
+record WebexMessage(string Id, string Author, DateTimeOffset Created, string Text, string? ParentId = null);
+
+// One emoji reaction tally on a Webex message. Name is Webex's reaction id
+// ("thumbsup", "heart", ...); Mine is true when the linked account is among
+// the reactors (choosing the same emoji again then removes it).
+record WebexReaction(string Name, int Count, bool Mine);
 
 // One Markdown note in an Obsidian vault. RelPath is vault-relative with
 // forward slashes (the form obsidian:// URIs and wikilinks use).

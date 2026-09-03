@@ -193,7 +193,9 @@ while (true)
     }
 }
 
-// Release the embedded browsers / Playwright drivers cleanly on exit.
+// Release the embedded browsers / Playwright drivers cleanly on exit, and
+// drop the Webex KMS session's temporary device registration.
+await WebexKms.ShutdownAsync();
 await NytBrowser.ShutdownAsync();
 await CloseTextsBrowserAsync();
 TextsBrowser.Driver?.Dispose();
@@ -8049,8 +8051,21 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
         }
     }
 
+    // Reaction tallies ride the internal conversation API, so they're
+    // best-effort: any failure just renders the messages without them.
+    async Task<Dictionary<string, List<WebexReaction>>> FetchReactionsAsync()
+    {
+        try { return await WebexApi.GetReactionsAsync(room.Id); }
+        catch (Exception ex)
+        {
+            AppLog.Debug("webex reactions", ex);
+            return [];
+        }
+    }
+
     var messages = await FetchAsync("Loading messages...");
     if (messages == null) return;
+    var reactions = await FetchReactionsAsync();
     MarkSeen();
 
     while (true)
@@ -8059,17 +8074,50 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
         var sb = new StringBuilder();
         var dividerShown = false;
 
-        if (messages.Count == 0) sb.Append("[grey]No messages here yet.[/]\n");
-        foreach (var m in messages)
+        void Append(WebexMessage m, bool reply, bool orphan)
         {
             if (!dividerShown && m.Created > seenAt)
             {
                 sb.Append($"[red]{divider}[/]\n\n");
                 dividerShown = true;
             }
-            sb.Append($"[bold cyan]{Markup.Escape(m.Author)}[/]  [grey]{m.Created:MMM d, h:mm tt}[/]\n");
-            sb.Append(Markup.Escape(m.Text)).Append("\n\n");
+            var indent = reply ? "    " : "";
+            sb.Append($"{indent}{(reply ? "[grey]↪[/] " : "")}[bold cyan]{Markup.Escape(m.Author)}[/]  [grey]{m.Created:MMM d, h:mm tt}[/]" +
+                      (orphan ? "  [grey](reply to an earlier message)[/]" : "") + "\n");
+            foreach (var line in m.Text.Split('\n'))
+                sb.Append(indent).Append(Markup.Escape(line)).Append('\n');
+            if (reactions.TryGetValue(WebexApi.InternalUuid(m.Id), out var tallies) && tallies.Count > 0)
+                sb.Append(indent).Append(string.Join("  ", tallies.Select(r =>
+                    $"[{(r.Mine ? "bold cyan" : "grey")}]{ReactionEmoji(r.Name)} {r.Count}[/]"))).Append('\n');
+            sb.Append('\n');
         }
+
+        if (messages.Count == 0) sb.Append("[grey]No messages here yet.[/]\n");
+        var byId = messages.ToDictionary(m => m.Id);
+        var shown = new HashSet<string>();
+        foreach (var m in messages)
+        {
+            if (shown.Contains(m.Id)) continue;
+            // A reply whose thread root is in the window renders under that
+            // root; one whose root scrolled out of the window (or out of the
+            // fetch) starts the thread itself, tagged as an orphan.
+            if (m.ParentId != null && byId.ContainsKey(m.ParentId)) continue;
+            Append(m, reply: false, orphan: m.ParentId != null);
+            shown.Add(m.Id);
+            var threadId = m.ParentId ?? m.Id;
+            foreach (var r in messages.Where(x => x.ParentId == threadId && !shown.Contains(x.Id)))
+            {
+                Append(r, reply: true, orphan: false);
+                shown.Add(r.Id);
+            }
+        }
+
+        // Undecryptable reaction names mean the OAuth link predates the
+        // spark:kms scope — say how to fix it rather than showing 🔒 forever.
+        if (reactions.Values.Any(l => l.Any(r => r.Name == WebexApi.SealedReaction)))
+            sb.Append("[grey]🔒 = encrypted reaction. To read them: add the spark:kms scope to your\n" +
+                      "integration at developer.webex.com, delete data/webex-token.json, and reopen\n" +
+                      "the Webex section to sign in again.[/]\n");
 
         var panel = new Panel(new Markup(sb.ToString().TrimEnd('\n')))
         {
@@ -8081,7 +8129,8 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
 
         var actions = new[]
         {
-            (ConsoleKey.R, "R post"), (ConsoleKey.L, "L older"), (ConsoleKey.F5, "F5 refresh")
+            (ConsoleKey.R, "R post"), (ConsoleKey.T, "T reply"), (ConsoleKey.E, "E react"),
+            (ConsoleKey.L, "L older"), (ConsoleKey.F5, "F5 refresh")
         };
         var links = BuildLinks([], messages.Select(m => (string?)m.Text).ToArray());
 
@@ -8092,6 +8141,7 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
         if (key == ConsoleKey.F5) // idle timeout or manual — pull the latest messages
         {
             messages = await FetchAsync("Refreshing...") ?? messages;
+            reactions = await FetchReactionsAsync();
             MarkSeen();
             continue;
         }
@@ -8117,6 +8167,59 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
             continue;
         }
 
+        if (key == ConsoleKey.T && messages.Count > 0)
+        {
+            var target = PickWebexMessage(messages, "Reply in which thread?");
+            if (target == null) continue;
+            var snippet = target.Text.ReplaceLineEndings(" ");
+            if (snippet.Length > 40) snippet = snippet[..37] + "...";
+            var reply = PromptReplyLine(
+                $"[green]Reply to \"{Markup.Escape(snippet)}\"[/] [grey](leave blank to cancel):[/]");
+            if (reply.Length == 0) continue;
+            try
+            {
+                // Replies always attach to the thread root — picking a reply
+                // continues its thread (Webex threads are one level deep).
+                await AnsiConsole.Status().StartAsync("Posting reply...",
+                    async _ => await WebexApi.SendMessageAsync(room.Id, reply, target.ParentId ?? target.Id));
+                messages = await FetchAsync("Refreshing...") ?? messages;
+                MarkSeen();
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Couldn't post the reply:[/] {Markup.Escape(ex.Message)}\n");
+                PauseForKey();
+            }
+            continue;
+        }
+
+        if (key == ConsoleKey.E && messages.Count > 0)
+        {
+            var target = PickWebexMessage(messages, "React to which message?");
+            if (target == null) continue;
+            var mine = reactions.TryGetValue(WebexApi.InternalUuid(target.Id), out var current)
+                ? current.Where(r => r.Mine).Select(r => r.Name).ToHashSet()
+                : [];
+            var emojiOptions = WebexApi.ReactionNames.Select(n =>
+                $"{ReactionEmoji(n)}  [grey]{n}[/]" +
+                (mine.Contains(n) ? "  [yellow](already yours — choosing it again removes it)[/]" : "")).ToList();
+            emojiOptions.Add("<= Cancel");
+            var pick = PromptMenu("React with:", emojiOptions, 15);
+            if (pick < 0 || pick == emojiOptions.Count - 1) continue;
+            try
+            {
+                await AnsiConsole.Status().StartAsync("Reacting...",
+                    async _ => await WebexApi.ToggleReactionAsync(room.Id, target.Id, WebexApi.ReactionNames[pick]));
+                reactions = await FetchReactionsAsync();
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Couldn't react:[/] {Markup.Escape(ex.Message)}\n");
+                PauseForKey();
+            }
+            continue;
+        }
+
         if (key == ConsoleKey.L && messages.Count > 0)
         {
             var older = await FetchAsync("Loading older messages...", before: messages[0].Id);
@@ -8127,6 +8230,39 @@ static async Task ShowWebexRoomAsync(WebexRoom room)
         return;
     }
 }
+
+// Menu over a Webex space's most recent messages so the user can pick one to
+// reply to or react to. Returns null when they cancel.
+static WebexMessage? PickWebexMessage(List<WebexMessage> messages, string title)
+{
+    var recent = messages.Skip(Math.Max(0, messages.Count - 15)).ToList();
+    var options = recent.Select(m =>
+    {
+        var snippet = m.Text.ReplaceLineEndings(" ");
+        if (snippet.Length > 60) snippet = snippet[..57] + "...";
+        return $"{(m.ParentId != null ? "[grey]↪[/] " : "")}[bold cyan]{Markup.Escape(m.Author)}:[/] {Markup.Escape(snippet)}";
+    }).ToList();
+    options.Add("<= Cancel");
+    var idx = PromptMenu(title, options, 15, initialSelected: options.Count - 2);
+    return idx < 0 || idx == options.Count - 1 ? null : recent[idx];
+}
+
+// Terminal face for a Webex reaction name; unknown names show as-is (newer
+// clients can react with arbitrary emoji, which arrive as the character).
+static string ReactionEmoji(string name) => name switch
+{
+    "thumbsup" => "👍",
+    "heart" => "❤",
+    "celebrate" => "🎉",
+    "smiley" => "😊",
+    "haha" => "😂",
+    "confused" => "😕",
+    "sad" => "😢",
+    "wow" => "😮",
+    "thumbsdown" => "👎",
+    WebexApi.SealedReaction => "🔒",
+    _ => name,
+};
 
 // Google Tasks section: task lists through the official API (OAuth link on
 // first use — GoogleTasks.cs). Lists → tasks with subtasks indented, C checks

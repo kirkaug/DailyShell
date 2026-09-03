@@ -18,7 +18,10 @@ static class WebexApi
     // directory-shaped, and the callback lands on the bare /webex path).
     public const string RedirectUri = "http://localhost:8442/webex";
     const string ListenerPrefix = "http://localhost:8442/";
-    const string Scopes = "spark:all";
+    // spark:kms rides along for the reactions feature: it lets the KMS
+    // (WebexKms.cs) hand over space keys to decrypt reaction names. The
+    // integration at developer.webex.com must have both scopes enabled.
+    const string Scopes = "spark:all spark:kms";
 
     static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(30) };
     static readonly string TokenPath = Paths.Data("webex-token.json");
@@ -166,7 +169,8 @@ static class WebexApi
 
     // ----- Token upkeep ----------------------------------------------------
 
-    static async Task<string> GetTokenAsync()
+    // Also used by WebexKms for its device/KMS calls.
+    public static async Task<string> GetTokenAsync()
     {
         var t = LoadTokens() ?? throw new InvalidOperationException(
             "Webex isn't linked yet — reopen the Webex section to sign in.");
@@ -274,7 +278,7 @@ static class WebexApi
                   (beforeMessageId != null ? $"&beforeMessage={Uri.EscapeDataString(beforeMessageId)}" : "");
         using var doc = JsonDocument.Parse(await SendAsync(HttpMethod.Get, url));
 
-        var raw = new List<(string Id, string PersonId, string PersonEmail, DateTimeOffset Created, string Text)>();
+        var raw = new List<(string Id, string PersonId, string PersonEmail, DateTimeOffset Created, string Text, string? ParentId)>();
         foreach (var m in doc.RootElement.GetProperty("items").EnumerateArray())
         {
             var parts = new List<string>();
@@ -296,19 +300,23 @@ static class WebexApi
                 m.TryGetProperty("personEmail", out var pe) && pe.ValueKind == JsonValueKind.String ? pe.GetString()! : "",
                 m.TryGetProperty("created", out var c) && c.ValueKind == JsonValueKind.String
                     ? DateTimeOffset.Parse(c.GetString()!).ToLocalTime() : DateTimeOffset.MinValue,
-                string.Join("\n", parts)));
+                string.Join("\n", parts),
+                m.TryGetProperty("parentId", out var par) && par.ValueKind == JsonValueKind.String
+                    ? par.GetString() : null));
         }
         raw.Reverse();
 
         var messages = new List<WebexMessage>();
         foreach (var m in raw)
-            messages.Add(new WebexMessage(m.Id, await DisplayNameAsync(m.PersonId, m.PersonEmail), m.Created, m.Text));
+            messages.Add(new WebexMessage(m.Id, await DisplayNameAsync(m.PersonId, m.PersonEmail), m.Created, m.Text, m.ParentId));
         return messages;
     }
 
-    public static Task SendMessageAsync(string roomId, string text) =>
+    // With parentId set, the message is posted as a threaded reply under that
+    // thread's root message (the public API threads one level deep).
+    public static Task SendMessageAsync(string roomId, string text, string? parentId = null) =>
         SendAsync(HttpMethod.Post, $"{ApiBase}/messages",
-            JsonSerializer.Serialize(new { roomId, text }));
+            JsonSerializer.Serialize(parentId == null ? new { roomId, text } : (object)new { roomId, text, parentId }));
 
     // The linked account's display name — shown once after the OAuth link as a
     // "signed in as" confirmation.
@@ -342,6 +350,185 @@ static class WebexApi
 
     static string EmailName(string email) =>
         email.Length == 0 ? "unknown" : email.Split('@')[0];
+
+    // ----- Reactions (internal conversation service) -------------------------
+    // Emoji reactions aren't in the public REST API at all, so these use the
+    // same internal "conversation service" the Webex clients themselves use;
+    // it accepts the integration's spark:all token. Message text there is
+    // end-to-end encrypted (this code never reads it — text comes from the
+    // public API), but reaction names, counts, and reactor ids are plain
+    // metadata. conv-a.wbx2.com is the US cluster, verified for this org.
+    const string ConvBase = "https://conv-a.wbx2.com/conversation/api/v1";
+
+    // The reaction names the conversation service accepts.
+    public static readonly string[] ReactionNames =
+        ["thumbsup", "heart", "celebrate", "smiley", "haha", "confused", "sad"];
+
+    // Public API ids are base64 of "ciscospark://us/MESSAGE/<uuid>" (same shape
+    // for rooms/people); the internal service wants the bare uuid.
+    public static string InternalUuid(string hydraId)
+    {
+        var b64 = hydraId.Replace('-', '+').Replace('_', '/');
+        b64 += (b64.Length % 4) switch { 2 => "==", 3 => "=", _ => "" };
+        var uri = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+        return uri[(uri.LastIndexOf('/') + 1)..];
+    }
+
+    static string? _myUuid;
+    static async Task<string> MyUuidAsync()
+    {
+        if (_myUuid != null) return _myUuid;
+        using var doc = JsonDocument.Parse(await SendAsync(HttpMethod.Get, $"{ApiBase}/people/me"));
+        return _myUuid = InternalUuid(doc.RootElement.GetProperty("id").GetString()!);
+    }
+
+    // Placeholder name for a reaction whose encrypted name couldn't be opened
+    // (KMS refused the key — usually a link made before the spark:kms scope).
+    public const string SealedReaction = "encrypted";
+
+    // Reaction tallies for a room's recent messages, keyed by the message's
+    // internal uuid (InternalUuid of the public message id). One activities
+    // fetch covers the recent window; messages older than it just show none.
+    // Names arrive E2E-encrypted from real clients; they're decrypted with the
+    // space's KMS key (legacy plaintext names pass straight through).
+    public static async Task<Dictionary<string, List<WebexReaction>>> GetReactionsAsync(string roomId, int limit = 100)
+    {
+        var me = await MyUuidAsync();
+        var raw = new List<(string MsgUuid, string? KeyUrl, List<(string Name, int Count, bool Mine)> Tallies)>();
+        using (var doc = JsonDocument.Parse(await SendAsync(HttpMethod.Get,
+                   $"{ConvBase}/conversations/{InternalUuid(roomId)}/activities?limit={limit}&includeChildren=true")))
+            foreach (var item in doc.RootElement.GetProperty("items").EnumerateArray())
+            {
+                // Summaries appear both as standalone activities (verb "add",
+                // object "reaction2Summary", parent = the message) and as children
+                // on the message's own activity; either carries the same tallies.
+                if (item.TryGetProperty("object", out var obj) &&
+                    obj.TryGetProperty("objectType", out var ot) && ot.GetString() == "reaction2Summary" &&
+                    item.TryGetProperty("parent", out var parent) &&
+                    parent.TryGetProperty("id", out var pid) && pid.ValueKind == JsonValueKind.String)
+                    raw.Add((pid.GetString()!, KeyUrlOf(item), ParseReactions(obj, me)));
+
+                if (item.TryGetProperty("children", out var children) && children.ValueKind == JsonValueKind.Array)
+                    foreach (var child in children.EnumerateArray())
+                        if (child.TryGetProperty("type", out var ct) && ct.GetString() == "reactionSummary" &&
+                            child.TryGetProperty("activity", out var act) &&
+                            act.TryGetProperty("object", out var childObj) &&
+                            item.TryGetProperty("id", out var mid) && mid.ValueKind == JsonValueKind.String)
+                            raw.Add((mid.GetString()!, KeyUrlOf(act), ParseReactions(childObj, me)));
+            }
+
+        var map = new Dictionary<string, List<WebexReaction>>();
+        foreach (var (msgUuid, keyUrl, tallies) in raw)
+        {
+            var list = new List<WebexReaction>();
+            foreach (var (name, count, mine) in tallies)
+                list.Add(new WebexReaction(await PlainReactionNameAsync(name, keyUrl), count, mine));
+            map[msgUuid] = list;
+        }
+        return map;
+    }
+
+    static string? KeyUrlOf(JsonElement activity) =>
+        activity.TryGetProperty("encryptionKeyUrl", out var k) && k.ValueKind == JsonValueKind.String
+            ? k.GetString() : null;
+
+    // A reaction name as stored may be plaintext (legacy) or a compact JWE;
+    // JWEs are opened with the space key, or collapse to SealedReaction.
+    static async Task<string> PlainReactionNameAsync(string name, string? keyUrl)
+    {
+        if (!name.Contains('.')) return name;
+        if (keyUrl != null && await WebexKms.TryGetKeyAsync(keyUrl) is { } key &&
+            WebexKms.TryDecrypt(key, name) is { } plain)
+            return plain;
+        return SealedReaction;
+    }
+
+    static List<(string Name, int Count, bool Mine)> ParseReactions(JsonElement reaction2Summary, string myUuid)
+    {
+        var list = new List<(string, int, bool)>();
+        if (!reaction2Summary.TryGetProperty("reactions", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return list;
+        foreach (var r in arr.EnumerateArray())
+        {
+            var mine = r.TryGetProperty("users", out var users) && users.ValueKind == JsonValueKind.Array &&
+                       users.EnumerateArray().Any(u =>
+                           u.TryGetProperty("id", out var uid) && uid.GetString() == myUuid);
+            var count = r.TryGetProperty("count", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetInt32() : 0;
+            if (r.TryGetProperty("displayName", out var n) && n.ValueKind == JsonValueKind.String && count > 0)
+                list.Add((n.GetString()!, count, mine));
+        }
+        return list;
+    }
+
+    // Adds the named reaction to a message, or removes it when this account
+    // already reacted with it (returns true = added, false = removed).
+    public static async Task<bool> ToggleReactionAsync(string roomId, string messageId, string name)
+    {
+        var conv = InternalUuid(roomId);
+        var msg = InternalUuid(messageId);
+        var me = await MyUuidAsync();
+
+        // Look for this account's existing reaction of that name on the message
+        // (stored names may be encrypted, so compare after decryption).
+        string? existing = null;
+        var candidates = new List<(string Id, string Raw, string? KeyUrl)>();
+        using (var doc = JsonDocument.Parse(await SendAsync(HttpMethod.Get,
+                   $"{ConvBase}/conversations/{conv}/parents/{msg}?activityType=reaction")))
+            foreach (var item in doc.RootElement.GetProperty("items").EnumerateArray())
+                if (item.TryGetProperty("actor", out var actor) &&
+                    actor.TryGetProperty("entryUUID", out var au) && au.GetString() == me)
+                    candidates.Add((item.GetProperty("id").GetString()!,
+                        item.GetProperty("object").GetProperty("displayName").GetString()!,
+                        KeyUrlOf(item)));
+        foreach (var c in candidates)
+            if (await PlainReactionNameAsync(c.Raw, c.KeyUrl) == name)
+                existing = c.Id;
+
+        if (existing != null)
+        {
+            await SendAsync(HttpMethod.Post, $"{ConvBase}/activities?personRefresh=true", JsonSerializer.Serialize(new
+            {
+                actor = new { objectType = "person", id = me },
+                @object = new { id = existing, objectType = "activity" },
+                objectType = "activity",
+                target = new { id = conv, objectType = "conversation" },
+                verb = "delete",
+            }));
+            return false;
+        }
+
+        // The reaction must carry the message's own encryptionKeyUrl plus an
+        // hmac. With the space key from KMS the name is encrypted and the hmac
+        // computed exactly like the official clients, so the reaction is
+        // indistinguishable from a native one. Without the key (token linked
+        // before the spark:kms scope) it falls back to a plaintext name and a
+        // placeholder hmac, which the service files as a legacy reaction.
+        string? keyUrl;
+        using (var doc = JsonDocument.Parse(await SendAsync(HttpMethod.Get, $"{ConvBase}/activities/{msg}")))
+            keyUrl = KeyUrlOf(doc.RootElement);
+        if (keyUrl == null)
+            throw new InvalidOperationException("That message can't take reactions (no encryption key found).");
+
+        var kmsKey = await WebexKms.TryGetKeyAsync(keyUrl);
+        var displayName = kmsKey != null ? WebexKms.Encrypt(kmsKey, name) : name;
+        var hmac = kmsKey != null
+            ? WebexKms.ReactionHmac(kmsKey, msg, name)
+            : Convert.ToHexString(
+                new System.Security.Cryptography.HMACSHA256(Encoding.UTF8.GetBytes(msg))
+                    .ComputeHash(Encoding.UTF8.GetBytes(msg + name))).ToLowerInvariant();
+
+        await SendAsync(HttpMethod.Post, $"{ConvBase}/activities?personRefresh=true", JsonSerializer.Serialize(new
+        {
+            actor = new { objectType = "person", id = me },
+            target = new { id = conv, objectType = "conversation" },
+            verb = "add",
+            objectType = "activity",
+            encryptionKeyUrl = keyUrl,
+            parent = new { type = "reaction", id = msg },
+            @object = new { objectType = "reaction2", displayName, hmac },
+        }));
+        return true;
+    }
 
     static async Task<string> SendAsync(HttpMethod method, string url, string? jsonBody = null)
     {

@@ -119,7 +119,7 @@ integrations you want.
 | `[reddit-oauth]` | Reddit scores/comments | Client id + secret from a free 'script' app at reddit.com/prefs/apps |
 | `[nyt-cookies]` | Full NYT article text | Your nytimes.com Cookie header (or use the in-app "Connect NYT account") |
 | `[discord]` | Discord section | Your Discord user token (instructions in Settings) |
-| `[webex]` | Webex section | Client ID + secret of a free integration from [developer.webex.com](https://developer.webex.com/my-apps) (redirect URI `http://localhost:8442/webex`, scope `spark:all`); browser sign-in on first use |
+| `[webex]` | Webex section (threads + emoji reactions included) | Client ID + secret of a free integration from [developer.webex.com](https://developer.webex.com/my-apps) (redirect URI `http://localhost:8442/webex`, scopes `spark:all` + `spark:kms`); browser sign-in on first use |
 | `[gemini]` | Gemini chat | Nothing needed for the browser mode (sign in on first use); optional API key from [AI Studio](https://aistudio.google.com/app/apikey) + `model = ...` for local API chats |
 | `[obsidian]` | Obsidian notes | Nothing needed (vaults auto-detect); optionally a vault path or `Label \| path` per line |
 | `[paylocity]` | Time clock | `company = ...` (always); SSO companies need nothing else — non-SSO also add `username`/`password` lines; optional `url = ...` |
@@ -148,6 +148,14 @@ you pressed the key. Remap them in **Settings → F-key shortcuts**
   token. Discord's Terms of Service forbid automating a user account; this app
   keeps usage minimal (read messages, send read-receipts, post what you type),
   but use it at your own discretion.
+- **Webex reactions**: viewing and adding emoji reactions uses the internal
+  "conversation service" and KMS (end-to-end encryption key) APIs the official
+  Webex clients use — the public REST API has no reactions at all. Reaction
+  names are E2E-encrypted, so the app fetches each space's key over the same
+  KMS protocol as a real client (this needs the `spark:kms` scope; without it,
+  reactions show as 🔒). Undocumented APIs that could change without notice —
+  messages, threads, and posting stay on the public API, so only reactions
+  would break.
 - **Gemini**: the browser mode automates the gemini.google.com web app with
   your signed-in Google session — an unofficial, scraping-based integration
   that can break when Google changes the page, and automating a consumer
