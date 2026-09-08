@@ -92,7 +92,7 @@ while (true)
     // While the header fetch is still running, refreshWhen redraws the menu the
     // moment it lands (so a slow first fetch doesn't leave the header blank until
     // the next visit); with the clock on, a 60s auto-refresh keeps the time honest.
-    var mainIdx = PromptMenu("[green]Pick an option:[/]", mainOptions, 15, backAction: "exit", initialSelected: lastSourceIdx,
+    var mainIdx = PromptMenu("[green]Pick an option:[/]", mainOptions, 15, backAction: "exit", initialSelected: lastSourceIdx, rootMenu: true,
         autoRefresh: DisplayOn("clock") || DisplayOn("notify") ? TimeSpan.FromSeconds(60) : null,
         refreshWhen: menuHeaderTask.IsCompleted ? null : () => menuHeaderTask.IsCompleted);
     if (mainIdx <= -2)
@@ -4708,13 +4708,15 @@ static string ExtractReadableText(HtmlDocument doc)
 }
 
 // Selection menu that supports going back: returns the chosen index, or -1 when the
-// user presses Esc, Backspace, or Q. Items may contain Spectre markup. Draws in
+// user presses Esc, Q, or Left. Items may contain Spectre markup. Draws in
 // place below the current cursor so headers/messages above it stay visible.
 // With autoRefresh set, returns -2 - selected after that much idle time so the
 // caller can rebuild the list; MenuTimedOut decodes that signal. With action
 // set, pressing that key returns -1000 - selected (MenuActioned decodes it) so
-// the caller can act on the highlighted item without entering it.
-static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0, TimeSpan? autoRefresh = null, Func<bool>? refreshWhen = null, (ConsoleKey Key, string Hint)? action = null)
+// the caller can act on the highlighted item without entering it. rootMenu
+// drops Left from the back keys — at the top level there's nothing to back
+// out to, so only a deliberate Esc/Q exits.
+static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageSize = 15, string backAction = "go back", int initialSelected = 0, TimeSpan? autoRefresh = null, Func<bool>? refreshWhen = null, (ConsoleKey Key, string Hint)? action = null, bool rootMenu = false)
 {
     pageSize = Math.Clamp(Math.Min(pageSize, items.Count), 1, Math.Max(1, Console.WindowHeight - 5));
     var frameHeight = pageSize + 3; // title + items + more-indicator + key hints
@@ -4760,7 +4762,7 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
         var more = (top > 0 ? "▲ more above  " : "") + (top + pageSize < items.Count ? "▼ more below" : "");
         WriteLine(more.Length > 0 ? $"[grey]{more}[/]" : "");
         WriteLine($"[grey]Up/Down move • Enter/→ select{(action is { } ah ? $" • {ah.Hint}" : "")}" +
-                  $"{(Notify.Count > 0 && !Notify.CenterOpen ? " • N notifications" : "")} • ←/Esc/Backspace/Q {backAction}[/]");
+                  $"{(Notify.Count > 0 && !Notify.CenterOpen ? " • N notifications" : "")} • {(rootMenu ? "Esc/Q" : "←/Esc/Q")} {backAction}[/]");
 
         if (autoRefresh != null || refreshWhen != null)
         {
@@ -4817,7 +4819,8 @@ static int PromptMenu(string titleMarkup, IReadOnlyList<string> items, int pageS
                 Console.Write(new string('\n', frameHeight));
                 startTop = Math.Max(0, Console.CursorTop - frameHeight);
                 break;
-            case ConsoleKey.Escape or ConsoleKey.Backspace or ConsoleKey.Q or ConsoleKey.LeftArrow:
+            case ConsoleKey.Escape or ConsoleKey.Q:
+            case ConsoleKey.LeftArrow when !rootMenu:
                 Console.SetCursorPosition(0, Math.Min(startTop + frameHeight, Console.BufferHeight - 1));
                 return -1;
         }
@@ -4906,7 +4909,7 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
         var extraHint = actions is { Length: > 0 } ? ", " + string.Join(", ", actions.Select(a => a.Hint)) : "";
         var olderHint = loadMoreAtTop && offset == 0 ? " (↑ loads older)" : "";
         var notifyHint = Notify.Count > 0 && !Notify.CenterOpen ? ", N notifications" : "";
-        AnsiConsole.Markup($"[grey]{position}{olderHint} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}{notifyHint}, ←/Esc/Backspace/Q back[/]");
+        AnsiConsole.Markup($"[grey]{position}{olderHint} — Up/Down scroll, PgUp/PgDn page{openHint}{extraHint}{notifyHint}, ←/Esc/Q back[/]");
 
         if (autoRefresh is { } interval)
         {
@@ -4968,7 +4971,7 @@ static ConsoleKey? ShowInPager(IRenderable content, List<(string Label, string U
                 && !Shortcuts.Open && ShortcutTarget(fkey) is { } jump:
                 OpenShortcutAsync(jump).GetAwaiter().GetResult();
                 break; // the loop repaints the header and content in full
-            case ConsoleKey.Enter or ConsoleKey.Escape or ConsoleKey.Q or ConsoleKey.Backspace or ConsoleKey.LeftArrow:
+            case ConsoleKey.Enter or ConsoleKey.Escape or ConsoleKey.Q or ConsoleKey.LeftArrow:
                 ClearWithHeader();
                 return null;
         }
@@ -7036,13 +7039,32 @@ static async Task ShowGeminiAsync()
             await page.WaitForSelectorAsync(
                 $"chat-app, {editorSelector}, a[href*='accounts.google.com'], input[type='email']",
                 new PageWaitForSelectorOptions { State = WaitForSelectorState.Attached, Timeout = timeoutMs });
-            await Task.Delay(2000);
             // Only Gemini's OWN signed-out markers count. Generic checks (like any
             // accounts.google.com anchor) misfire: signed-in pages carry account
-            // links too ("Manage your Google Account" etc.).
-            return await page.EvaluateAsync<bool>(
-                "() => !document.querySelector(\"[data-test-id='signed-out-disclaimer'], " +
-                "[data-test-id='mavatar-sign-in-icon-button']\")");
+            // links too ("Manage your Google Account" etc.). Both sides' markers
+            // render several seconds AFTER <chat-app> attaches, so a one-shot
+            // check after a fixed delay misreads a signed-out page as signed in
+            // (and the section then shows a bogus empty history) — poll until a
+            // definitive marker from either side shows up. Signed-out is checked
+            // first: the mavatar footer exists in both states, so only the
+            // account avatar / a real conversation proves signed-in.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (true)
+            {
+                var state = await page.EvaluateAsync<string>(
+                    @"() => {
+                        if (document.querySelector(""[data-test-id='signed-out-disclaimer'], "" +
+                            ""[data-test-id='mavatar-sign-in-icon-button']"")) return 'out';
+                        if (document.querySelector(""user-profile-picture, [data-test-id='conversation']"")) return 'in';
+                        return 'unknown';
+                    }");
+                if (state == "in") return true;
+                // On timeout neither marker showed — treat that as signed out too,
+                // so the user lands in the (recoverable) sign-in flow instead of a
+                // dead-end empty conversation list.
+                if (state == "out" || DateTime.UtcNow >= deadline) return false;
+                await Task.Delay(500);
+            }
         }
 
         var signedIn = await AnsiConsole.Status().StartAsync("Opening Gemini...",
