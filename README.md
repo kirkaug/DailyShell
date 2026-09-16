@@ -69,7 +69,9 @@ folder browsing, full-text search, and notes rendered in the terminal with
 headings, task checkboxes, and `[[wikilinks]]` (which `O` follows into the
 Obsidian app). Today's daily note doubles as a quick-capture inbox — `A`
 appends a timestamped line, creating the note from your daily-note template if
-it doesn't exist yet. `E` opens any note in Obsidian itself.
+it doesn't exist yet. Past daily notes lists the entries from 1/3/6/9 months
+ago and each prior year (skipping dates with no note) for a quick look back.
+`E` opens any note in Obsidian itself.
 
 **Time clock** — punch the Paylocity time clock from the terminal (first
 pass): Paylocity ends web sessions on browser close, so the app signs in

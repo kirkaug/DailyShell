@@ -150,6 +150,33 @@ static class ObsidianVault
         return (folder.Length > 0 ? folder + "/" : "") + date.ToString(MomentToNet(format)) + ".md";
     }
 
+    // Daily notes from fixed look-back intervals — 1/3/6/9 months, then each
+    // prior year — keeping only dates whose note actually exists on disk.
+    // AddMonths/AddYears clamp short months and leap days (Mar 31 → Feb 28).
+    public static List<(string Ago, ObsidianNote Note)> PastDailyNotes(Vault vault)
+    {
+        var (folder, format, _) = DailySettings(vault);
+        var today = DateTime.Today;
+        var candidates = new List<(string Ago, DateTime Date)>
+        {
+            ("1 month ago", today.AddMonths(-1)),
+            ("3 months ago", today.AddMonths(-3)),
+            ("6 months ago", today.AddMonths(-6)),
+            ("9 months ago", today.AddMonths(-9)),
+        };
+        for (var years = 1; today.Year - years >= 2000; years++)
+            candidates.Add(($"{years} year{(years == 1 ? "" : "s")} ago", today.AddYears(-years)));
+
+        var results = new List<(string, ObsidianNote)>();
+        foreach (var (ago, date) in candidates)
+        {
+            var rel = (folder.Length > 0 ? folder + "/" : "") + date.ToString(MomentToNet(format)) + ".md";
+            var full = Path.Combine(vault.Root, rel.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(full)) results.Add((ago, ToNote(vault, full)));
+        }
+        return results;
+    }
+
     // The Moment.js date tokens Obsidian uses, mapped to .NET ones. Year and
     // day-of-month differ in case; months (M/MM) and weekday names (ddd/dddd)
     // are already identical. Enough for daily-note filenames.

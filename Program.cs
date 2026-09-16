@@ -8693,6 +8693,7 @@ static void ShowObsidian()
     }
 
     const string daily = "[green]Today's daily note[/]";
+    const string past = "[green]Past daily notes[/]";
     const string search = "[green]Search notes[/]";
     const string browse = "[green]Browse folders[/]";
     var lastIdx = 0;
@@ -8713,7 +8714,7 @@ static void ShowObsidian()
         ClearWithHeader();
         AnsiConsole.MarkupLine($"[bold blue]Obsidian[/] [grey]— {Markup.Escape(vault.Name)}[/]");
 
-        var options = new List<string> { daily, search, browse };
+        var options = new List<string> { daily, past, search, browse };
         options.AddRange(recent.Select(n =>
         {
             var dir = Path.GetDirectoryName(n.RelPath)?.Replace('\\', '/') ?? "";
@@ -8727,11 +8728,41 @@ static void ShowObsidian()
         lastIdx = idx;
 
         if (options[idx] == daily) ShowObsidianDailyNote(vault);
+        else if (options[idx] == past) ShowObsidianPastDaily(vault);
         else if (options[idx] == search) ShowObsidianSearch(vault);
         else if (options[idx] == browse) ShowObsidianFolder(vault, "");
-        else ShowObsidianNote(vault, recent[idx - 3]);
+        else ShowObsidianNote(vault, recent[idx - 4]);
     }
     ClearWithHeader();
+}
+
+// Daily notes from set intervals back (1/3/6/9 months, then each prior year),
+// limited to the dates that actually have a note. One menu, pick to read.
+static void ShowObsidianPastDaily(ObsidianVault.Vault vault)
+{
+    var lastIdx = 0;
+    while (true)
+    {
+        var entries = ObsidianVault.PastDailyNotes(vault);
+        ClearWithHeader();
+        AnsiConsole.MarkupLine($"[bold blue]Obsidian[/] [grey]— past daily notes[/]");
+        if (entries.Count == 0)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]No daily notes found at 1/3/6/9 months or any prior year back from today.[/]\n");
+            PauseForKey();
+            return;
+        }
+
+        var options = entries.Select(e =>
+            $"{Markup.Escape(e.Note.Title)}  [grey]{e.Ago}[/]").ToList();
+        options.Add("<= Back");
+
+        var idx = PromptMenu("Open which daily note?", options, 18, initialSelected: lastIdx);
+        if (idx < 0 || idx == options.Count - 1) return;
+        lastIdx = idx;
+        ShowObsidianNote(vault, entries[idx].Note);
+    }
 }
 
 // Folder browser, one level per call (going back pops naturally up the stack).
