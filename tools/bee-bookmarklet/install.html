@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bee bookmarklet test</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5 }
+  a.bm { display: inline-block; padding: .5rem 1rem; background: #f7da21; color: #000; border-radius: 6px; text-decoration: none; font-weight: 600 }
+  textarea { width: 100%; height: 6rem; font: 12px monospace }
+  code { background: #eee; padding: 0 .25em }
+</style>
+<h1>Bee bookmarklet (test)</h1>
+
+<p><b>Desktop:</b> drag this to your bookmarks bar:</p>
+<p><a class="bm" id="link" href="#">Bee Hints</a></p>
+
+<p><b>Phone:</b> copy the text below, bookmark any page, edit that bookmark, and paste this
+into the URL field (name it <code>Bee</code>). Then open
+<code>nytimes.com/puzzles/spelling-bee</code> while signed in, and run the bookmark.</p>
+<p><button id="copy">Copy bookmarklet text</button></p>
+<textarea id="src" readonly></textarea>
+
+<p>Results page the bookmarklet opens (defaults to the <code>index.html</code> next to this page; clear it to get
+the on-page overlay instead). If you change this, re-install the bookmark.</p>
+<p><input id="target" style="width:100%"></p>
+
+<script>
+// The bookmarklet. Runs in the NYT page, so its same-origin fetch carries the
+// user's cookies. Nothing leaves nytimes.com unless the user clicks the handoff link.
+function bee(HANDOFF) {
+  var ID = 'bee-helper-overlay', old = document.getElementById(ID);
+  if (old) { old.remove(); return; }
+  var t = window.gameData && window.gameData.today;
+  if (!t) { alert('Open nytimes.com/puzzles/spelling-bee first (puzzle data not found).'); return; }
+
+  var box = document.createElement('div');
+  box.id = ID;
+  box.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;background:#fff;color:#000;' +
+    'font:13px/1.4 monospace;padding:12px;border:2px solid #000;border-radius:8px;' +
+    'width:min(95vw,440px);max-height:90vh;overflow:auto;box-shadow:0 4px 20px rgba(0,0,0,.4)';
+  document.body.appendChild(box);
+  var close = '<button onclick="this.parentNode.remove()" style="float:right">x</button>';
+  box.innerHTML = close + 'Loading your saved words...';
+
+  fetch('/svc/games/state/spelling_bee/latest?puzzle_id=' + t.id, { credentials: 'include' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (j) {
+      var found = ((j.game_data && j.game_data.answers) || []).map(function (w) { return w.toLowerCase(); });
+      var foundSet = {}; found.forEach(function (w) { foundSet[w] = 1; });
+      var answers = t.answers.map(function (w) { return w.toLowerCase(); });
+      var pang = {}; t.pangrams.forEach(function (w) { pang[w.toLowerCase()] = 1; });
+
+      if (HANDOFF) {
+        var q = new URLSearchParams({
+          d: t.printDate, id: String(t.id), c: t.centerLetter.toLowerCase(),
+          o: t.outerLetters.join('').toLowerCase(), a: answers.join(','),
+          p: t.pangrams.join(',').toLowerCase(), f: found.join(',')
+        });
+        location.href = HANDOFF + '#' + q.toString();
+        return;
+      }
+
+      var lens = [], seen = {};
+      answers.forEach(function (a) { if (!seen[a.length]) { seen[a.length] = 1; lens.push(a.length); } });
+      lens.sort(function (a, b) { return a - b; });
+      var letters = {}; answers.forEach(function (a) { letters[a[0]] = 1; });
+
+      var h = close + '<b>Spelling Bee ' + t.printDate + '</b><br>Found ' + found.filter(function (w) { return answers.indexOf(w) >= 0; }).length +
+        ' of ' + answers.length + '<br><br>';
+      h += '<table style="border-collapse:collapse"><tr><th></th>' +
+        lens.map(function (l) { return '<th style="padding:2px 6px">' + l + '</th>'; }).join('') + '<th>&Sigma;</th></tr>';
+      Object.keys(letters).sort().forEach(function (L) {
+        var rowAll = answers.filter(function (a) { return a[0] === L; }), rowGot = rowAll.filter(function (a) { return foundSet[a]; });
+        h += '<tr><th>' + L.toUpperCase() + '</th>';
+        lens.forEach(function (l) {
+          var all = rowAll.filter(function (a) { return a.length === l; }), got = all.filter(function (a) { return foundSet[a]; });
+          var style = all.length === 0 ? 'color:#bbb' : got.length === all.length ? 'color:#0a0;font-weight:bold' : '';
+          h += '<td style="padding:2px 6px;text-align:right;' + style + '">' + (all.length ? got.length + '/' + all.length : '&middot;') + '</td>';
+        });
+        h += '<td style="padding:2px 6px;text-align:right' + (rowGot.length === rowAll.length ? ';color:#0a0;font-weight:bold' : '') +
+          '">' + rowGot.length + '/' + rowAll.length + '</td></tr>';
+      });
+      h += '</table><br>';
+
+      /* Pangram summary: total / found, and how many are "perfect" (exactly 7 letters,
+         each used once). Unfound pangrams show only their length, no spoilers. */
+      var pangs = t.pangrams.map(function (w) { return w.toLowerCase(); });
+      var perfect = pangs.filter(function (w) { return w.length === 7; });
+      var pFound = pangs.filter(function (w) { return foundSet[w]; });
+      var perfectFound = perfect.filter(function (w) { return foundSet[w]; });
+      var pMissing = pangs.filter(function (w) { return !foundSet[w]; })
+        .map(function (w) { return w.length + (w.length === 7 ? ' (perfect)' : ''); });
+      h += '<b>Pangrams:</b> ' + pFound.length + '/' + pangs.length + ' found<br>' +
+        '<b>Perfect:</b> ' + (perfect.length ? perfectFound.length + '/' + perfect.length + ' found' : 'none today') + '<br>' +
+        (pMissing.length ? 'Still hidden: ' + pMissing.join(', ') + ' letters<br>' : 'All pangrams found!<br>') + '<br>';
+
+      /* Two-letter list: words by first two letters, found/total, green when complete. */
+      var pre = {};
+      answers.forEach(function (a) {
+        var k = a.slice(0, 2);
+        pre[k] = pre[k] || { all: 0, got: 0 };
+        pre[k].all++;
+        if (foundSet[a]) pre[k].got++;
+      });
+      h += '<b>Two-letter list:</b><br>' + Object.keys(pre).sort().map(function (k) {
+        var p = pre[k], s = k.toUpperCase() + ' ' + p.got + '/' + p.all;
+        return p.got === p.all ? '<span style="color:#0a0;font-weight:bold">' + s + '</span>' : s;
+      }).join(' &nbsp; ') + '<br><br>';
+
+      h += found.sort().map(function (w) { return pang[w] ? '<b style="color:#c90">' + w.toUpperCase() + '</b>' : w; }).join(' ');
+      box.innerHTML = h;
+    })
+    .catch(function (e) { box.innerHTML = close + 'Failed: ' + e.message; });
+}
+
+var link = document.getElementById('link'), src = document.getElementById('src'), target = document.getElementById('target');
+function build() {
+  var code = 'javascript:(' + bee.toString() + ')(' + JSON.stringify(target.value.trim()) + ')';
+  link.href = code;
+  src.value = code;
+}
+target.value = new URL('index.html', location.href).href;
+target.addEventListener('input', build);
+document.getElementById('copy').onclick = function () { src.select(); document.execCommand('copy'); };
+build();
+</script>
