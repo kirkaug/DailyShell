@@ -55,7 +55,8 @@ function bee(HANDOFF) {
           o: t.outerLetters.join('').toLowerCase(), a: answers.join(','),
           p: t.pangrams.join(',').toLowerCase(), f: found.join(',')
         });
-        location.href = HANDOFF + '#' + q.toString();
+        var url = HANDOFF + '#' + q.toString();
+        if (!window.open(url, 'bee-hints')) location.href = url;
         return;
       }
 

@@ -179,14 +179,20 @@ function render(date) {
   app.append(list.childNodes.length ? list : el('p', '', 'Nothing found yet.'));
 }
 
-var current = ingest();
-var days = savedDates();
-current = current || days[0];
-if (days.length > 1) {
-  var sel = $('days'); sel.hidden = false;
+var sel = $('days');
+sel.onchange = function () { render(sel.value); };
+
+/* (Re)build the day picker and show a day. Runs on load and whenever the bookmarklet
+   hands off again into this already-open tab (only the URL fragment changes). */
+function show(date) {
+  var days = savedDates();
+  date = date || days[0];
+  sel.textContent = '';
   days.forEach(function (d) { var o = el('option', '', d); o.value = d; sel.append(o); });
-  sel.value = current;
-  sel.onchange = function () { render(sel.value); };
+  sel.hidden = days.length < 2;
+  sel.value = date;
+  render(date);
 }
-render(current);
+show(ingest());
+window.addEventListener('hashchange', function () { var d = ingest(); if (d) show(d); });
 </script>
